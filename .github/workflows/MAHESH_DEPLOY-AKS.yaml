@@ -1,0 +1,221 @@
+name: Mahesh-AKS-deploy crack detection
+
+# Triggered manually from the GitHub Actions tab.
+# Deploys the crack-detection app to an AKS cluster created by the
+# "Deploy Kubernetes Cluster" workflow in concrete-detection-infra.
+# The app is exposed on the public IP of an ingress-nginx controller (HTTP, no DNS/SSL yet).
+#
+# Credentials: if azure_client_id / azure_client_secret are left blank, the
+# repository secrets AZURE_CLIENT_ID / AZURE_CLIENT_SECRET are used instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy = install/upgrade the app | uninstall = remove the app and ingress controller"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - uninstall
+      azure_subscription_id:
+        description: "[Azure] Subscription ID"
+        required: true
+        type: string
+      azure_tenant_id:
+        description: "[Azure] Tenant ID (Directory ID)"
+        required: true
+        type: string
+      azure_client_id:
+        description: "[Azure] Service Principal Client ID (leave blank to use secrets.AZURE_CLIENT_ID)"
+        required: false
+        type: string
+      azure_client_secret:
+        description: "[Azure] Service Principal Client Secret (leave blank to use secrets.AZURE_CLIENT_SECRET)"
+        required: false
+        type: string
+      aks_cluster_name:
+        description: "[Azure] AKS cluster name"
+        required: true
+        default: "crack-detection-cluster"
+        type: string
+      aks_resource_group:
+        description: "[Azure] AKS resource group (leave blank for '<cluster_name>-rg')"
+        required: false
+        type: string
+      image_tag:
+        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 1.0.5)'
+        required: true
+        default: "auto"
+        type: string
+
+jobs:
+  AKS-deploy-concrete-detection:
+    name: AKS-deploy-concrete-detection
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Print input parameters
+      run: |
+        echo "================================================"
+        echo "  Pipeline Input Parameters"
+        echo "================================================"
+        echo "  action               : ${{ github.event.inputs.action }}"
+        echo "  azure_subscription_id: ${{ github.event.inputs.azure_subscription_id }}"
+        echo "  azure_tenant_id      : ${{ github.event.inputs.azure_tenant_id }}"
+        echo "  azure_client_id      : ${{ github.event.inputs.azure_client_id != '' && 'provided' || 'NOT provided (using secrets)' }}"
+        echo "  azure_client_secret  : ${{ github.event.inputs.azure_client_secret != '' && 'provided' || 'NOT provided (using secrets)' }}"
+        echo "  aks_cluster_name     : ${{ github.event.inputs.aks_cluster_name }}"
+        echo "  aks_resource_group   : ${{ github.event.inputs.aks_resource_group }}"
+        echo "  image_tag            : ${{ github.event.inputs.image_tag }}"
+        echo "================================================"
+
+    - name: Log in to DockerHub
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+
+    - name: Resolve Docker Image Tag
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      id: resolve_tag
+      run: |
+        INPUT_TAG="${{ github.event.inputs.image_tag }}"
+        if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
+          echo "Resolving latest semantic tag from Docker Hub..."
+          REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+          TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+          LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [[ -z "$LATEST_TAG" ]]; then
+            LATEST_TAG="latest"
+          fi
+          echo "Resolved tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+        else
+          echo "Using specified tag: $INPUT_TAG"
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Verify Docker images exist
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      run: |
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+
+    - name: Authenticate to Azure
+      env:
+        INPUT_CLIENT_ID: ${{ github.event.inputs.azure_client_id }}
+        INPUT_CLIENT_SECRET: ${{ github.event.inputs.azure_client_secret }}
+        SECRET_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        SECRET_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        TENANT_ID: ${{ github.event.inputs.azure_tenant_id }}
+        SUBSCRIPTION_ID: ${{ github.event.inputs.azure_subscription_id }}
+      run: |
+        CLIENT_ID="${INPUT_CLIENT_ID:-$SECRET_CLIENT_ID}"
+        CLIENT_SECRET="${INPUT_CLIENT_SECRET:-$SECRET_CLIENT_SECRET}"
+        echo "::add-mask::$CLIENT_SECRET"
+        if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" ]]; then
+          echo "::error::Azure client ID/secret missing: provide them as inputs or set secrets AZURE_CLIENT_ID / AZURE_CLIENT_SECRET"
+          exit 1
+        fi
+        az login --service-principal -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID" --output none
+        az account set --subscription "$SUBSCRIPTION_ID"
+        echo "Azure CLI authenticated for subscription: $SUBSCRIPTION_ID"
+
+    - name: Configure kubectl for AKS
+      run: |
+        CLUSTER_NAME="${{ github.event.inputs.aks_cluster_name }}"
+        RG="${{ github.event.inputs.aks_resource_group }}"
+        if [[ -z "$RG" ]]; then
+          RG="${CLUSTER_NAME}-rg"
+        fi
+        echo "Fetching credentials for AKS cluster '$CLUSTER_NAME' in resource group '$RG'..."
+        az aks get-credentials --resource-group "$RG" --name "$CLUSTER_NAME" --overwrite-existing --admin
+        kubectl get nodes
+
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Ensure NGINX Ingress Controller is installed (AKS)
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      run: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        # Azure Load Balancer health probes must hit /healthz, otherwise the LB marks nodes unhealthy.
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx --create-namespace \
+          --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz \
+          --set controller.service.externalTrafficPolicy=Local \
+          --wait --timeout 10m
+        kubectl get svc ingress-nginx-controller -n ingress-nginx
+
+    - name: Deploy Application using Helm on AKS
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      run: |
+        helm upgrade --install nfs-server ./nfsserverChart
+        kubectl rollout status deployment nfs-server-depl --timeout=180s
+        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
+        if [[ -z "$NFS_CIP" ]]; then
+          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
+          exit 1
+        fi
+        echo "NFS ClusterIP: $NFS_CIP"
+        helm upgrade --install master-chart ./masterChart \
+          -f ./masterChart/values-azure.yaml \
+          --set pv-chart.nfsCIP="$NFS_CIP" \
+          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
+          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
+        for d in image-upload-depl crack-detection-depl concrete-image-gallery-depl; do
+          kubectl rollout status deployment "$d" --timeout=300s || {
+            echo "::warning::Deployment $d did not become ready in time"
+            kubectl describe deployment "$d" | tail -20 || true
+            kubectl get pods -o wide || true
+          }
+        done
+
+    - name: Retrieve Ingress public IP
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      run: |
+        for i in {1..60}; do
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          if [[ -n "$IP" ]]; then
+            echo "================================================"
+            echo "Deployment Successful on AKS!"
+            echo "  External IP : $IP"
+            echo "  Gallery URL : http://$IP/"
+            echo "  Upload URL  : http://$IP/upload"
+            echo "================================================"
+            {
+              echo "### Crack detection deployed to AKS"
+              echo ""
+              echo "- Gallery: http://$IP/"
+              echo "- Upload: http://$IP/upload"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Waiting for LoadBalancer IP... (attempt $i/60)"
+          sleep 5
+        done
+        echo "::error::Failed to retrieve ingress public IP"
+        kubectl get svc -n ingress-nginx || true
+        exit 1
+
+    - name: Uninstall Application from AKS
+      if: ${{ github.event.inputs.action == 'uninstall' }}
+      run: |
+        helm uninstall master-chart --wait || true
+        helm uninstall nfs-server --wait || true
+        helm uninstall ingress-nginx -n ingress-nginx --wait || true
+        kubectl delete pv concrete-images-pv-nfs mypvc --ignore-not-found=true || true
+        echo "Remaining resources:"
+        kubectl get all -A | grep -v kube-system || true

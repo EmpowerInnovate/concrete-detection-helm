@@ -1,0 +1,8 @@
+global:
+  provider: azure
+  # Ingress served by the ingress-nginx controller installed by the AKS deploy workflow.
+  # Leave hosts empty to serve the app on the controller's public IP (no DNS/SSL yet).
+  # To use a domain later, list it here, e.g. hosts: ["aks.example.com"].
+  ingress:
+    className: nginx
+    hosts: []
