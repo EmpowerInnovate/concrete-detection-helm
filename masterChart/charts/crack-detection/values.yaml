@@ -1,0 +1,13 @@
+# Default values for imageUploadChart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# image:
+#   repository: maheshrajannan/crack-detection-logic
+#   tag: latest
+
+# global:
+#   crackDetectionImage: maheshrajannan/crack-detection-logic:latest
+
+labels:
+  app: crack-detection-pod

@@ -1,0 +1,10 @@
+global:
+  provider: digitalocean
+  domainName: mahesh.concretecrackgallery.in
+  certSecretName: concrete-gallery-tls
+  ingress:
+    className: nginx
+    annotations:
+      kubernetes.io/ingress.class: "nginx"
+
+

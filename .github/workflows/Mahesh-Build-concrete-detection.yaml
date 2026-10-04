@@ -1,0 +1,63 @@
+name: Mahesh Build and push docker images
+
+on:
+  push:
+    branches:
+      - master
+      - feature/parameterize-ingress-gcp-do
+  workflow_dispatch: # Enables manual trigger from the GitHub Actions tab
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+
+    - name: Determine Docker Image Tag
+      id: get_tag
+      run: |
+        echo "Auto-incrementing tag..."
+        REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+        TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+        LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+        if [[ -z "$LATEST_TAG" ]]; then
+          NEXT_TAG="1.0.1"
+        else
+          IFS='.' read -r major minor patch <<< "$LATEST_TAG"
+          next_patch=$((patch + 1))
+          NEXT_TAG="${major}.${minor}.${next_patch}"
+        fi
+        echo "Resolved tag: $NEXT_TAG"
+        echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Build and Push Image Upload Logic
+      run: |
+        cd buildConcreteDetection/imageUpload
+        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:latest .
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:latest
+
+    - name: Build and Push Crack Detection Logic
+      run: |
+        cd buildConcreteDetection/crackDetection
+        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:latest .
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:latest
+
+    - name: Build and Push Concrete Image Gallery Logic
+      run: |
+        cd buildConcreteDetection/concreteImageGallery
+        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:latest .
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:latest

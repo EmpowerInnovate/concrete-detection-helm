@@ -1,0 +1,17 @@
+{{- if eq (default "gcp" .Values.global.provider) "gcp" }}
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: {{ default "concrete-gallery-cert" .Values.global.certName }}
+  namespace: default
+spec:
+  domains:
+    {{- if .Values.global.domains }}
+    {{- range .Values.global.domains }}
+    - {{ . }}
+    {{- end }}
+    {{- else }}
+    - mahesh.concretecrackgallery.online
+    - maheshconcretegallery.online
+    {{- end }}
+{{- end }}

@@ -1,0 +1,192 @@
+name: Mahesh-GKE-SSL-deploy crack detection 
+
+# Triggered manually from the GitHub Actions tab
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcp_sa_key_base64:
+        description: "GCP SA key base64 single-line. Linux: base64 -w 0 key.json | Mac: base64 -i key.json | tr -d '\\n'"
+        required: true
+        type: string
+      gcp_cluster_name:
+        description: "[GCP] GKE cluster name"
+        required: true
+        type: string
+      gcp_cluster_zone:
+        description: "[GCP] GKE cluster zone e.g. us-central1-a"
+        required: true
+        type: string
+      gcp_project_id:
+        description: "[GCP] GCP project ID"
+        required: true
+        type: string
+      image_tag:
+        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 0.0.3)'
+        required: true
+        default: 'auto'
+        type: string
+
+jobs:
+  GKE-SSL-deploy-concrete-detection:
+    name: GKE-SSL-deploy-concrete-detection
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Print input parameters
+      run: |
+        echo "================================================"
+        echo "  Pipeline Input Parameters"
+        echo "================================================"
+        echo "  gcp_project_id  : ${{ github.event.inputs.gcp_project_id }}"
+        echo "  gcp_cluster_name: ${{ github.event.inputs.gcp_cluster_name }}"
+        echo "  gcp_cluster_zone: ${{ github.event.inputs.gcp_cluster_zone }}"
+        echo "  gcp_sa_key_base64: ${{ github.event.inputs.gcp_sa_key_base64 != '' && '*** provided ***' || 'NOT provided' }}"
+        echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
+        echo "================================================"
+
+    - name: Log in to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+
+    - name: Resolve Docker Image Tag
+      id: resolve_tag
+      run: |
+        INPUT_TAG="${{ github.event.inputs.image_tag }}"
+        if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
+          echo "Resolving latest semantic tag from Docker Hub..."
+          REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+          TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+          LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [[ -z "$LATEST_TAG" ]]; then
+            LATEST_TAG="latest"
+          fi
+          echo "Resolved tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+        else
+          echo "Using specified tag: $INPUT_TAG"
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Verify Docker images exist
+      run: |
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        version: 'latest'
+
+    - name: Authenticate to Google Cloud
+      env:
+        GCP_SA_KEY_BASE64: ${{ github.event.inputs.gcp_sa_key_base64 }}
+      run: |
+        echo "$GCP_SA_KEY_BASE64" | tr -d '\n' | base64 -d > $HOME/gcp-key.json
+        gcloud auth activate-service-account --key-file=$HOME/gcp-key.json
+        gcloud config set project ${{ github.event.inputs.gcp_project_id }}
+        echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcp-key.json" >> $GITHUB_ENV
+
+    # Step 2: Install the gke-gcloud-auth-plugin using gcloud SDK
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud components install gke-gcloud-auth-plugin
+
+    # Step 3: Configure kubectl to connect to the GKE cluster
+    - name: Configure kubectl
+      run: |
+        gcloud container clusters get-credentials ${{ github.event.inputs.gcp_cluster_name }} \
+        --zone ${{ github.event.inputs.gcp_cluster_zone }} \
+        --project ${{ github.event.inputs.gcp_project_id }}
+
+    # Step 4: Install Helm directly
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    
+    - name: Create global static IP (if not exists)
+      run: |
+        IP_NAME="concrete-detection-ip"
+        GCP_PROJECT="${{ github.event.inputs.gcp_project_id }}"
+        echo "Checking if static IP '$IP_NAME' exists..."
+        EXISTING_IP=$(gcloud compute addresses describe $IP_NAME --global --project=$GCP_PROJECT --format="value(address)" 2>/dev/null || true)
+        if [[ -z "$EXISTING_IP" ]]; then
+          echo "Static IP not found, creating..."
+          gcloud compute addresses create $IP_NAME --global --project=$GCP_PROJECT
+        else
+          echo "Static IP already exists: $EXISTING_IP"
+        fi
+
+    - name: Deploy Application using Helm
+      run: |
+        helm upgrade --install nfs-server ./nfsserverChart
+        sleep 3
+        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
+        if [[ -z "$NFS_CIP" ]]; then
+          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
+          exit 1
+        fi
+        echo "NFS ClusterIP: $NFS_CIP"
+        helm upgrade --install master-chart ./masterChart \
+          -f ./masterChart/values-gcp.yaml \
+          --set pv-chart.nfsCIP="$NFS_CIP" \
+          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
+          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
+        sleep 5
+        
+    - name: Wait for Ingress IP & Create/Update Cloud DNS A Record
+      run: |
+        DOMAIN_NAME="maheshconcretegallery.online"
+        DNS_ZONE_NAME="concrete-zone-1"
+        TTL=300
+        GCP_PROJECT="${{ github.event.inputs.gcp_project_id }}"
+    
+        # Check if Cloud DNS managed zone exists
+        echo "Checking if DNS zone '$DNS_ZONE_NAME' exists..."
+        if ! gcloud dns managed-zones describe $DNS_ZONE_NAME --project=$GCP_PROJECT > /dev/null 2>&1; then
+          echo "DNS zone '$DNS_ZONE_NAME' not found. Creating..."
+          gcloud dns managed-zones create $DNS_ZONE_NAME \
+            --project=$GCP_PROJECT \
+            --description="Managed zone for crack detection" \
+            --dns-name="${DOMAIN_NAME}." \
+            --visibility="public"
+        else
+          echo "DNS zone '$DNS_ZONE_NAME' already exists."
+        fi
+    
+        echo "Waiting for ingress IP to be provisioned..."
+        kubectl wait --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' ingress/concrete-gallery-ingress --timeout=600s
+        EXTERNAL_IP=$(kubectl get ingress concrete-gallery-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        echo "Found Ingress IP: $EXTERNAL_IP"
+    
+        echo "Updating DNS record for $DOMAIN_NAME to $EXTERNAL_IP"
+    
+        # Check if existing A record exists
+        EXISTING=$(gcloud dns record-sets list \
+          --zone=$DNS_ZONE_NAME \
+          --name="${DOMAIN_NAME}." \
+          --type=A \
+          --format="value(rrdatas[0])")
+    
+        gcloud dns record-sets transaction start --zone=$DNS_ZONE_NAME
+    
+        if [[ -n "$EXISTING" ]]; then
+          echo "Removing old record: $EXISTING"
+          gcloud dns record-sets transaction remove "$EXISTING" \
+            --name="${DOMAIN_NAME}." --ttl=$TTL --type=A --zone=$DNS_ZONE_NAME
+        fi
+    
+        echo "Adding new A record: $EXTERNAL_IP"
+        gcloud dns record-sets transaction add "$EXTERNAL_IP" \
+          --name="${DOMAIN_NAME}." --ttl=$TTL --type=A --zone=$DNS_ZONE_NAME
+    
+        gcloud dns record-sets transaction execute --zone=$DNS_ZONE_NAME

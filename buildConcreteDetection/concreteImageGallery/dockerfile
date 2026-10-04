@@ -1,0 +1,29 @@
+# downloads image from docker file
+FROM node
+
+# set working directory in docker image
+WORKDIR /app
+
+# copy the package.json file from local to docker image under folder /app/package.json
+COPY package.json /app/package.json
+
+# install the node in docker image
+RUN npm install --silent
+
+# here it copies the folder
+COPY . /app
+
+# Install process manager 2 for production ready app
+RUN npm install pm2 -g
+
+# it will show us present working dir
+RUN pwd
+
+# it will show us all the read-write permission and access
+RUN ls -lrt	
+
+# port of expose is 8082 - we can change it to any port but not 80 because it is already used by ingress
+EXPOSE 8082
+
+# run the node app
+CMD ["pm2-runtime", "server.js"]

@@ -1,0 +1,8 @@
+# Ignore packaged charts
+*.tgz
+
+# Ignore subchart dependency archive files (they are rebuilt by 'helm dependency build')
+masterChart/charts/*.tgz
+
+# OS files
+.DS_Store

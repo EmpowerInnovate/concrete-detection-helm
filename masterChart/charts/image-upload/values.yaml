@@ -1,0 +1,12 @@
+# Default values for imageUploadChart.
+# This is a YAML-formatted file.
+
+# image:
+#   repository: maheshrajannan/image-upload-logic
+#   tag: latest
+
+# global:
+#   imageUploadImage: maheshrajannan/image-upload-logic:latest
+
+labels:
+  app: image-upload-pod

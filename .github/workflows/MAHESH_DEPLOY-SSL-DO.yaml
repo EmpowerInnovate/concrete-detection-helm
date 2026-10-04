@@ -1,0 +1,185 @@
+name: Mahesh-DO-SSL-deploy crack detection 
+
+# Triggered manually from the GitHub Actions tab
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: "DigitalOcean API Token"
+        required: true
+        type: string
+      do_cluster_name:
+        description: "[DigitalOcean] DOKS cluster name"
+        required: true
+        type: string
+      image_tag:
+        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 2.0.0)'
+        required: true
+        default: 'auto'
+        type: string
+
+jobs:
+  DO-SSL-deploy-concrete-detection:
+    name: DO-SSL-deploy-concrete-detection
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Print input parameters
+      run: |
+        echo "================================================"
+        echo "  Pipeline Input Parameters"
+        echo "================================================"
+        echo "  do_cluster_name : ${{ github.event.inputs.do_cluster_name }}"
+        echo "  do_token        : ${{ github.event.inputs.do_token != '' && '*** provided ***' || 'NOT provided' }}"
+        echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
+        echo "================================================"
+
+    - name: Log in to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+
+    - name: Resolve Docker Image Tag
+      id: resolve_tag
+      run: |
+        INPUT_TAG="${{ github.event.inputs.image_tag }}"
+        if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
+          echo "Resolving latest semantic tag from Docker Hub..."
+          REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+          TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+          LATEST_TAG=$(echo "$TAGS" | grep -E '^2\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [[ -z "$LATEST_TAG" ]]; then
+            LATEST_TAG="latest"
+          fi
+          echo "Resolved tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+        else
+          echo "Using specified tag: $INPUT_TAG"
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Verify Docker images exist
+      run: |
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+
+    - name: Install doctl
+      uses: digitalocean/action-doctl@v2
+      with:
+        token: ${{ github.event.inputs.do_token }}
+
+    - name: Save DigitalOcean Kubeconfig
+      run: |
+        doctl kubernetes cluster kubeconfig save ${{ github.event.inputs.do_cluster_name }}
+
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Ensure NGINX Ingress Controller is installed and configured
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/do/deploy.yaml
+        sleep 3
+        kubectl patch configmap ingress-nginx-controller -n ingress-nginx --type merge -p '{"data":{"use-proxy-protocol":"false"}}' || true
+        kubectl rollout restart deployment ingress-nginx-controller -n ingress-nginx || true
+        kubectl rollout status deployment ingress-nginx-controller -n ingress-nginx --timeout=120s || true
+        kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
+        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
+
+    - name: Deploy Application using Helm on DigitalOcean
+      run: |
+        kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
+        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
+        helm upgrade --install nfs-server ./nfsserverChart
+        sleep 3
+        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
+        if [[ -z "$NFS_CIP" ]]; then
+          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
+          exit 1
+        fi
+        echo "NFS ClusterIP: $NFS_CIP"
+        kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
+        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
+        helm upgrade --install master-chart ./masterChart \
+          -f ./masterChart/values-digitalocean.yaml \
+          --set pv-chart.nfsCIP="$NFS_CIP" \
+          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
+          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
+        sleep 5
+
+    - name: Retrieve Ingress LoadBalancer IP
+      id: ingress-ip
+      run: |
+        # Wait for the LoadBalancer IP to be assigned (with timeout)
+        for i in {1..30}; do
+          IP=$(kubectl get ingress concrete-gallery-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          if [[ -z "$IP" ]]; then
+            IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          fi
+          if [[ -z "$IP" ]]; then
+            IP=$(kubectl get svc ingress-nginx-controller -n default -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          fi
+          if [[ -n "$IP" ]]; then
+            echo "Retrieved Ingress IP: $IP"
+            echo "ingressIp=$IP" >> $GITHUB_OUTPUT
+            echo "::set-output name=ingressIp::$IP"
+            exit 0
+          fi
+          echo "Waiting for Ingress IP to be assigned... (attempt $i/30)"
+          sleep 5
+        done
+        echo "::error::Failed to retrieve Ingress IP after 30 attempts"
+        exit 1
+
+    - name: Update DNS Records with Ingress IP
+      env:
+        DIGITALOCEAN_TOKEN: ${{ github.event.inputs.do_token || secrets.MAHESH_DIGITALOCEAN_ACCESS_TOKEN }}
+        DOMAIN: "mahesh.concretecrackgallery.in"
+        TTL: 300
+      run: |
+        NEW_IP="${{ steps.ingress-ip.outputs.ingressIp }}"
+        if [[ -z "$NEW_IP" ]]; then
+          echo "❌ Error: Ingress IP address is empty!"
+          exit 1
+        fi
+        
+        echo "🔍 Fetching existing A record for $DOMAIN..."
+        RECORD_INFO=$(doctl compute domain records list "$DOMAIN" --format ID,Type,Name,Data --no-header 2>/dev/null | awk '$2=="A" && ($3=="@" || $3=="") {print $1, $4}' || true)
+        
+        if [[ -n "$RECORD_INFO" ]]; then
+          RECORD_ID=$(echo "$RECORD_INFO" | awk '{print $1}')
+          CURRENT_IP=$(echo "$RECORD_INFO" | awk '{print $2}')
+          
+          if [[ "$CURRENT_IP" == "$NEW_IP" ]]; then
+            echo "✅ The existing A record already points to $NEW_IP. No update needed."
+          else
+            echo "🔄 Updating existing A record (ID: $RECORD_ID) for $DOMAIN..."
+            doctl compute domain records update "$DOMAIN" --record-id "$RECORD_ID" --record-data "$NEW_IP"
+            echo "✅ A record updated!"
+          fi
+        else
+          echo "📌 No existing A record found. Creating a new one..."
+          doctl compute domain records create "$DOMAIN" \
+            --record-type A \
+            --record-name "@" \
+            --record-data "$NEW_IP" \
+            --record-ttl "$TTL"
+          echo "✅ A record created!"
+        fi
+
+        echo "================================================"
+        echo "Deployment & DNS Update Successful!"
+        echo "  Domain      : $DOMAIN"
+        echo "  External IP : $NEW_IP"
+        echo "  Gallery URL : https://$DOMAIN/"
+        echo "  Upload URL  : https://$DOMAIN/upload"
+        echo "================================================"

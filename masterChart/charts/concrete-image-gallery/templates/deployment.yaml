@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: concrete-image-gallery-depl
+  labels:
+    {{- toYaml .Values.labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: concrete-image-gallery-pod
+  replicas: 1 
+  template:
+    metadata:
+      labels:
+        {{- toYaml .Values.labels | nindent 8 }}
+      annotations:
+        litmuschaos.io/chaos: "true"
+    spec:
+      volumes:
+        - name: concrete-images-pv-nfs
+          persistentVolumeClaim:
+            claimName: concrete-images-pvc-nfs
+      containers:
+        - name: concrete-image-gallery-pod
+          image: "{{ if contains "/" .Values.global.concreteGalleryImage }}{{ .Values.global.concreteGalleryImage }}{{ else }}{{ .Values.global.registry }}/{{ .Values.global.concreteGalleryImage }}{{ end }}"
+          imagePullPolicy: Always
+          volumeMounts:
+            - mountPath: "/app/uploads/images"
+              name: concrete-images-pv-nfs
+          ports:
+          - containerPort: 8082

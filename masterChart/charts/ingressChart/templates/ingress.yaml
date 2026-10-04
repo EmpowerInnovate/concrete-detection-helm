@@ -1,0 +1,63 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: concrete-gallery-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    networking.gke.io/managed-certificates: "concrete-gallery-cert"
+    kubernetes.io/ingress.global-static-ip-name: "concrete-detection-ip"
+spec:
+  ingressClassName: "gce"
+  rules:
+    # 1. AWS Route 53 Domain
+    - host: mahesh.concretecrackgallery.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: concrete-image-gallery-svc-lb
+                port:
+                  number: 8082
+          - path: /upload
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080
+          - path: /uploaded
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080
+
+    # 2. GCP Domain
+    - host: maheshconcretegallery.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: concrete-image-gallery-svc-lb
+                port:
+                  number: 8082
+          - path: /upload
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080
+          - path: /uploaded
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080

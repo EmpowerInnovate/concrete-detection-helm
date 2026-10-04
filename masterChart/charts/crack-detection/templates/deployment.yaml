@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crack-detection-depl
+  labels:
+    {{- toYaml .Values.labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: crack-detection-pod
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        {{- toYaml .Values.labels | nindent 8 }}
+      annotations:
+        litmuschaos.io/chaos: "true"
+    spec:
+      volumes:
+        - name: concrete-images-pv-nfs
+          persistentVolumeClaim:
+            claimName: concrete-images-pvc-nfs
+      containers:
+        - name: crack-detection-pod
+          image: "{{ if contains "/" .Values.global.crackDetectionImage }}{{ .Values.global.crackDetectionImage }}{{ else }}{{ .Values.global.registry }}/{{ .Values.global.crackDetectionImage }}{{ end }}"
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - mountPath: "/app/uploads/images"
+              name: concrete-images-pv-nfs
+          ports:
+          - containerPort: 8081

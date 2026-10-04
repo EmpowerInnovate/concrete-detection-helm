@@ -1,0 +1,14 @@
+global:
+  provider: gcp
+  domainName: maheshconcretegallery.online
+  domains:
+    - mahesh.concretecrackgallery.online
+    - maheshconcretegallery.online
+  certName: concrete-gallery-cert
+  staticIpName: concrete-detection-ip
+  ingress:
+    className: gce
+    annotations:
+      kubernetes.io/ingress.class: "gce"
+      networking.gke.io/managed-certificates: "concrete-gallery-cert"
+      kubernetes.io/ingress.global-static-ip-name: "concrete-detection-ip"
