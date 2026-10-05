@@ -5,6 +5,11 @@ name: Mahesh-AKS-deploy crack detection
 # "Deploy Kubernetes Cluster" workflow in concrete-detection-infra.
 # The app is exposed on the public IP of an ingress-nginx controller (HTTP, no DNS/SSL yet).
 #
+# Images: by default this workflow builds all three images from this commit and
+# pushes them to Docker Hub under a dedicated AKS tag series (aks-1.0.N, plus
+# aks-latest), then deploys exactly that tag. The aks- prefix keeps these builds
+# separate from the 1.x.y tags published by the generic build workflow (used by GKE/DO).
+#
 # Credentials: if azure_client_id / azure_client_secret are left blank, the
 # repository secrets AZURE_CLIENT_ID / AZURE_CLIENT_SECRET are used instead.
 
@@ -44,8 +49,13 @@ on:
         description: "[Azure] AKS resource group (leave blank for '<cluster_name>-rg')"
         required: false
         type: string
+      build_images:
+        description: "Build and push new AKS images (aks-1.0.N) from this commit and deploy them. Uncheck to deploy an existing tag instead."
+        required: true
+        default: true
+        type: boolean
       image_tag:
-        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 1.0.5)'
+        description: 'Used only when build_images is unchecked: tag to deploy ("auto" = latest aks-1.x.y tag, or an explicit tag e.g. aks-1.0.3)'
         required: true
         default: "auto"
         type: string
@@ -71,6 +81,7 @@ jobs:
         echo "  azure_client_secret  : ${{ github.event.inputs.azure_client_secret != '' && 'provided' || 'NOT provided (using secrets)' }}"
         echo "  aks_cluster_name     : ${{ github.event.inputs.aks_cluster_name }}"
         echo "  aks_resource_group   : ${{ github.event.inputs.aks_resource_group }}"
+        echo "  build_images         : ${{ github.event.inputs.build_images }}"
         echo "  image_tag            : ${{ github.event.inputs.image_tag }}"
         echo "================================================"
 
@@ -85,22 +96,61 @@ jobs:
       if: ${{ github.event.inputs.action == 'deploy' }}
       id: resolve_tag
       run: |
-        INPUT_TAG="${{ github.event.inputs.image_tag }}"
-        if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
-          echo "Resolving latest semantic tag from Docker Hub..."
-          REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
-          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
-          TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
-          LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
-          if [[ -z "$LATEST_TAG" ]]; then
-            LATEST_TAG="latest"
+        REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+        TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+        LATEST_AKS=$(echo "$TAGS" | grep -E '^aks-1\.[0-9]+\.[0-9]+$' | sed 's/^aks-//' | sort -V | tail -n 1 || true)
+
+        if [[ "${{ github.event.inputs.build_images }}" == "true" ]]; then
+          if [[ -z "$LATEST_AKS" ]]; then
+            NEXT="1.0.1"
+          else
+            IFS='.' read -r major minor patch <<< "$LATEST_AKS"
+            NEXT="${major}.${minor}.$((patch + 1))"
           fi
-          echo "Resolved tag: $LATEST_TAG"
-          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          TAG="aks-${NEXT}"
+          echo "New AKS build tag: $TAG"
         else
-          echo "Using specified tag: $INPUT_TAG"
-          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          INPUT_TAG="${{ github.event.inputs.image_tag }}"
+          if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
+            if [[ -z "$LATEST_AKS" ]]; then
+              echo "::error::No aks-1.x.y images found on Docker Hub. Run with build_images checked first."
+              exit 1
+            fi
+            TAG="aks-${LATEST_AKS}"
+            echo "Resolved latest AKS tag: $TAG"
+          else
+            TAG="$INPUT_TAG"
+            echo "Using specified tag: $TAG"
+          fi
         fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.build_images == 'true' }}
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push AKS images
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.build_images == 'true' }}
+      env:
+        REGISTRY: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        build_push() {
+          local dir="$1" image="$2"
+          echo "Building $REGISTRY/$image:$TAG from buildConcreteDetection/$dir ..."
+          docker build -f "buildConcreteDetection/$dir/dockerfile" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$REGISTRY/$image:$TAG" \
+            -t "$REGISTRY/$image:aks-latest" \
+            "buildConcreteDetection/$dir"
+          docker push "$REGISTRY/$image:$TAG"
+          docker push "$REGISTRY/$image:aks-latest"
+        }
+        build_push imageUpload          image-upload-logic
+        build_push crackDetection       crack-detection-logic
+        build_push concreteImageGallery concrete-image-gallery-logic
+        echo "Pushed AKS images with tag $TAG (commit $GITHUB_SHA)"
 
     - name: Verify Docker images exist
       if: ${{ github.event.inputs.action == 'deploy' }}
@@ -192,6 +242,7 @@ jobs:
             echo "================================================"
             echo "Deployment Successful on AKS!"
             echo "  External IP : $IP"
+            echo "  Image tag   : ${{ steps.resolve_tag.outputs.tag }}"
             echo "  Gallery URL : http://$IP/"
             echo "  Upload URL  : http://$IP/upload"
             echo "================================================"
@@ -200,6 +251,7 @@ jobs:
               echo ""
               echo "- Gallery: http://$IP/"
               echo "- Upload: http://$IP/upload"
+              echo "- Image tag: \`${{ steps.resolve_tag.outputs.tag }}\`"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
