@@ -4,7 +4,7 @@ name: Mahesh-AKS-deploy crack detection
 # Deploys the crack-detection app to an AKS cluster created by the
 # "Deploy Kubernetes Cluster" workflow in concrete-detection-infra.
 # The app is exposed on the public IP of an ingress-nginx controller (HTTP, no DNS/SSL yet).
-#
+# 
 # Images: by default this workflow builds all three images from this commit and
 # pushes them to Docker Hub under a dedicated AKS tag series (aks-1.0.N, plus
 # aks-latest), then deploys exactly that tag. The aks- prefix keeps these builds
