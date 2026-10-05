@@ -18,16 +18,33 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Log in to DockerHub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
-        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+      env:
+        DOCKER_USER: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        DOCKER_PASS: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+      run: |
+        # Strip stray spaces/newlines that often sneak in when secrets are pasted.
+        DOCKER_USER="$(printf '%s' "$DOCKER_USER" | tr -d '[:space:]')"
+        DOCKER_PASS="$(printf '%s' "$DOCKER_PASS" | tr -d '[:space:]')"
+        # Diagnostics only: lengths and character checks, never the values themselves.
+        echo "username length: ${#DOCKER_USER}, password length: ${#DOCKER_PASS}"
+        if [[ -z "$DOCKER_USER" || -z "$DOCKER_PASS" ]]; then
+          echo "::error::MAHESH_DOCKER_USERNAME or MAHESH_DOCKER_PASSWORD is empty"; exit 1
+        fi
+        if printf '%s' "$DOCKER_USER$DOCKER_PASS" | LC_ALL=C grep -q '[^ -~]'; then
+          echo "::error::A Docker secret contains non-ASCII characters (e.g. smart quotes or hidden characters). Re-type it."; exit 1
+        fi
+        if [[ "$DOCKER_USER" == *@* ]]; then
+          echo "::error::MAHESH_DOCKER_USERNAME looks like an email; use the Docker Hub username instead"; exit 1
+        fi
+        printf '%s' "$DOCKER_PASS" | docker login docker.io -u "$DOCKER_USER" --password-stdin
+        # Make the cleaned username available to the build/push steps below.
+        echo "DOCKER_USER=$DOCKER_USER" >> "$GITHUB_ENV"
 
     - name: Determine Docker Image Tag
       id: get_tag
       run: |
         echo "Auto-incrementing tag..."
-        REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+        REPO="${DOCKER_USER}/image-upload-logic"
         TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
         TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
         LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
@@ -44,20 +61,20 @@ jobs:
     - name: Build and Push Image Upload Logic
       run: |
         cd buildConcreteDetection/imageUpload
-        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:latest .
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.get_tag.outputs.tag }}
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:latest
+        docker build -f dockerfile -t ${DOCKER_USER}/image-upload-logic:${{ steps.get_tag.outputs.tag }} -t ${DOCKER_USER}/image-upload-logic:latest .
+        docker push ${DOCKER_USER}/image-upload-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${DOCKER_USER}/image-upload-logic:latest
 
     - name: Build and Push Crack Detection Logic
       run: |
         cd buildConcreteDetection/crackDetection
-        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:latest .
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.get_tag.outputs.tag }}
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:latest
+        docker build -f dockerfile -t ${DOCKER_USER}/crack-detection-logic:${{ steps.get_tag.outputs.tag }} -t ${DOCKER_USER}/crack-detection-logic:latest .
+        docker push ${DOCKER_USER}/crack-detection-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${DOCKER_USER}/crack-detection-logic:latest
 
     - name: Build and Push Concrete Image Gallery Logic
       run: |
         cd buildConcreteDetection/concreteImageGallery
-        docker build -f dockerfile -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }} -t ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:latest .
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }}
-        docker push ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:latest
+        docker build -f dockerfile -t ${DOCKER_USER}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }} -t ${DOCKER_USER}/concrete-image-gallery-logic:latest .
+        docker push ${DOCKER_USER}/concrete-image-gallery-logic:${{ steps.get_tag.outputs.tag }}
+        docker push ${DOCKER_USER}/concrete-image-gallery-logic:latest

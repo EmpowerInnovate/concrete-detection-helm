@@ -1,3 +1,46 @@
+{{- if eq (default "gcp" .Values.global.provider) "azure" }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: concrete-gallery-ingress
+  namespace: default
+  {{- with .Values.global.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ default "nginx" .Values.global.ingress.className | quote }}
+  rules:
+    {{- $hosts := .Values.global.ingress.hosts | default (list "") }}
+    {{- range $hosts }}
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: concrete-image-gallery-svc-lb
+                port:
+                  number: 8082
+          - path: /upload
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080
+          - path: /uploaded
+            pathType: Prefix
+            backend:
+              service:
+                name: image-upload-svc-lb
+                port:
+                  number: 8080
+      {{- with . }}
+      host: {{ . | quote }}
+      {{- end }}
+    {{- end }}
+{{- else }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -61,3 +104,4 @@ spec:
                 name: image-upload-svc-lb
                 port:
                   number: 8080
+{{- end }}

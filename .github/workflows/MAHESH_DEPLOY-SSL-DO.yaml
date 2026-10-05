@@ -14,7 +14,7 @@ on:
         required: true
         type: string
       image_tag:
-        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 2.0.0)'
+        description: 'Docker image tag to deploy (set to "auto" to automatically deploy the latest version tag, e.g. 1.0.5)'
         required: true
         default: 'auto'
         type: string
@@ -53,7 +53,7 @@ jobs:
           REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
           TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
           TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
-          LATEST_TAG=$(echo "$TAGS" | grep -E '^2\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          LATEST_TAG=$(echo "$TAGS" | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
           if [[ -z "$LATEST_TAG" ]]; then
             LATEST_TAG="latest"
           fi
