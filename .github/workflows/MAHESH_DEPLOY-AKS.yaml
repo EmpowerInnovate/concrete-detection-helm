@@ -427,8 +427,20 @@ jobs:
           BASE="https://$FQDN"
           if [[ "$TLS_MODE" == "letsencrypt" ]]; then
             # Real certificate: the HTTPS request must pass normal certificate verification.
-            if ! curl -sS -o /dev/null --retry 5 --retry-delay 5 --retry-all-errors "$BASE/"; then
-              echo "::error::HTTPS check against $BASE failed"
+            # ingress-nginx needs a little time to pick up the freshly issued secret (it serves its
+            # self-signed default cert until then), so poll. --resolve pins the name to the ingress IP
+            # so the runner's DNS cache cannot interfere.
+            OK=""
+            for i in {1..36}; do
+              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$FQDN:443:$IP" "$BASE/" 2>&1); then
+                OK=1
+                break
+              fi
+              echo "HTTPS not ready yet (attempt $i/36): $ERR"
+              sleep 5
+            done
+            if [[ -z "$OK" ]]; then
+              echo "::error::HTTPS check against $BASE failed: $ERR"
               exit 1
             fi
             echo "HTTPS verified with a trusted certificate."
