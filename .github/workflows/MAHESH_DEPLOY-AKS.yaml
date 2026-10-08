@@ -3,8 +3,19 @@ name: Mahesh-AKS-deploy crack detection
 # Triggered manually from the GitHub Actions tab.
 # Deploys the crack-detection app to an AKS cluster created by the
 # "Deploy Kubernetes Cluster" workflow in concrete-detection-infra.
-# The app is exposed on the public IP of an ingress-nginx controller (HTTP, no DNS/SSL yet).
-# 
+# The app is exposed through an ingress-nginx controller whose public IP gets a free
+# Azure DNS name: <dns_label>.<region>.cloudapp.azure.com. The bare IP keeps serving HTTP.
+#
+# SSL (tls_mode):
+#   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
+#   letsencrypt-staging - same, against Let's Encrypt's staging CA (untrusted cert, no rate
+#                         limits) - use it to test issuance before switching to letsencrypt
+#   mkcert              - certificate generated locally with mkcert, read from the repository
+#                         secrets AKS_TLS_CERT / AKS_TLS_KEY (PEM). Trusted only on machines
+#                         that have the mkcert root CA installed
+#   none                - HTTP only
+# The optional repository secret LETSENCRYPT_EMAIL registers the ACME account with an email.
+#
 # Images: by default this workflow builds all three images from this commit and
 # pushes them to Docker Hub under a dedicated AKS tag series (aks-1.0.N, plus
 # aks-latest), then deploys exactly that tag. The aks- prefix keeps these builds
@@ -17,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "deploy = install/upgrade the app | uninstall = remove the app and ingress controller"
+        description: "deploy = install/upgrade the app | uninstall = remove the app, ingress controller and cert-manager"
         required: true
         default: "deploy"
         type: choice
@@ -59,11 +70,29 @@ on:
         required: true
         default: "auto"
         type: string
+      dns_label:
+        description: "[Azure] DNS label for the ingress IP -> <label>.<region>.cloudapp.azure.com (unique per region)"
+        required: true
+        default: "crack-detection-mahesh"
+        type: string
+      tls_mode:
+        description: "SSL certificate source"
+        required: true
+        default: "letsencrypt"
+        type: choice
+        options:
+          - letsencrypt
+          - letsencrypt-staging
+          - mkcert
+          - none
 
 jobs:
   AKS-deploy-concrete-detection:
     name: AKS-deploy-concrete-detection
     runs-on: ubuntu-latest
+    env:
+      TLS_MODE: ${{ github.event.inputs.tls_mode }}
+      TLS_SECRET: concrete-gallery-tls
 
     steps:
     - name: Checkout code
@@ -83,6 +112,8 @@ jobs:
         echo "  aks_resource_group   : ${{ github.event.inputs.aks_resource_group }}"
         echo "  build_images         : ${{ github.event.inputs.build_images }}"
         echo "  image_tag            : ${{ github.event.inputs.image_tag }}"
+        echo "  dns_label            : ${{ github.event.inputs.dns_label }}"
+        echo "  tls_mode             : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
     - name: Log in to DockerHub
@@ -180,6 +211,9 @@ jobs:
         echo "Azure CLI authenticated for subscription: $SUBSCRIPTION_ID"
 
     - name: Configure kubectl for AKS
+      id: aks
+      env:
+        DNS_LABEL: ${{ github.event.inputs.dns_label }}
       run: |
         CLUSTER_NAME="${{ github.event.inputs.aks_cluster_name }}"
         RG="${{ github.event.inputs.aks_resource_group }}"
@@ -190,25 +224,140 @@ jobs:
         az aks get-credentials --resource-group "$RG" --name "$CLUSTER_NAME" --overwrite-existing --admin
         kubectl get nodes
 
+        # Azure DNS labels: 3-63 chars, lowercase letters/digits/hyphens, start with a letter.
+        if [[ ! "$DNS_LABEL" =~ ^[a-z][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+          echo "::error::Invalid dns_label '$DNS_LABEL' (use 3-63 lowercase letters, digits or hyphens, starting with a letter)"
+          exit 1
+        fi
+        LOCATION=$(az aks show --resource-group "$RG" --name "$CLUSTER_NAME" --query location -o tsv)
+        FQDN="${DNS_LABEL}.${LOCATION}.cloudapp.azure.com"
+        echo "App domain: $FQDN"
+        echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
     - name: Install Helm
       run: |
         curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
     - name: Ensure NGINX Ingress Controller is installed (AKS)
       if: ${{ github.event.inputs.action == 'deploy' }}
+      id: ingress
+      env:
+        DNS_LABEL: ${{ github.event.inputs.dns_label }}
+        FQDN: ${{ steps.aks.outputs.fqdn }}
       run: |
         helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
         helm repo update
         # Azure Load Balancer health probes must hit /healthz, otherwise the LB marks nodes unhealthy.
+        # azure-dns-label-name makes Azure publish <label>.<region>.cloudapp.azure.com for the LB IP.
         helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
           --namespace ingress-nginx --create-namespace \
           --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz \
+          --set-string controller.service.annotations."service\.beta\.kubernetes\.io/azure-dns-label-name"="$DNS_LABEL" \
           --set controller.service.externalTrafficPolicy=Local \
           --wait --timeout 10m
         kubectl get svc ingress-nginx-controller -n ingress-nginx
 
+        IP=""
+        for i in {1..60}; do
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          [[ -n "$IP" ]] && break
+          echo "Waiting for LoadBalancer IP... (attempt $i/60)"
+          sleep 5
+        done
+        if [[ -z "$IP" ]]; then
+          echo "::error::Failed to retrieve ingress public IP"
+          kubectl get svc -n ingress-nginx || true
+          exit 1
+        fi
+        echo "Ingress public IP: $IP"
+        echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
+        # Let's Encrypt validates over this name, so it must resolve before the certificate is requested.
+        for i in {1..60}; do
+          RESOLVED=$(dig +short "$FQDN" @1.1.1.1 | tail -n 1)
+          if [[ "$RESOLVED" == "$IP" ]]; then
+            echo "DNS ready: $FQDN -> $IP"
+            exit 0
+          fi
+          echo "Waiting for $FQDN to resolve to $IP (got '${RESOLVED:-nothing}')... (attempt $i/60)"
+          sleep 10
+        done
+        echo "::error::$FQDN does not resolve to $IP. The DNS label may already be taken in this region - try another dns_label."
+        kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
+        exit 1
+
+    - name: Install cert-manager and Let's Encrypt issuers
+      if: ${{ github.event.inputs.action == 'deploy' && startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      env:
+        ACME_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 10m
+
+        issuer() {
+          local name="$1" server="$2"
+          cat <<YAML
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata:
+          name: ${name}
+        spec:
+          acme:
+            server: ${server}
+        ${ACME_EMAIL:+    email: ${ACME_EMAIL}}
+            privateKeySecretRef:
+              name: ${name}-account-key
+            solvers:
+              - http01:
+                  ingress:
+                    ingressClassName: nginx
+        ---
+        YAML
+        }
+        {
+          issuer letsencrypt-prod    https://acme-v02.api.letsencrypt.org/directory
+          issuer letsencrypt-staging https://acme-staging-v02.api.letsencrypt.org/directory
+        } > issuers.yaml
+        cat issuers.yaml
+
+        # The cert-manager webhook can take a few seconds to accept requests after install.
+        for i in {1..12}; do
+          kubectl apply -f issuers.yaml && break
+          echo "cert-manager webhook not ready yet, retrying... (attempt $i/12)"
+          sleep 10
+        done
+        kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod clusterissuer/letsencrypt-staging --timeout=120s
+
+    - name: Create TLS secret from mkcert certificate
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.tls_mode == 'mkcert' }}
+      env:
+        TLS_CERT: ${{ secrets.AKS_TLS_CERT }}
+        TLS_KEY: ${{ secrets.AKS_TLS_KEY }}
+        FQDN: ${{ steps.aks.outputs.fqdn }}
+      run: |
+        if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+          echo "::error::tls_mode=mkcert needs repository secrets AKS_TLS_CERT and AKS_TLS_KEY (PEM contents of: mkcert $FQDN)"
+          exit 1
+        fi
+        printf '%s\n' "$TLS_CERT" > tls.crt
+        printf '%s\n' "$TLS_KEY" > tls.key
+        openssl x509 -in tls.crt -noout -subject -enddate
+        if ! openssl x509 -in tls.crt -noout -checkhost "$FQDN" | grep -q "does match"; then
+          echo "::warning::The mkcert certificate does not cover $FQDN - regenerate it with: mkcert $FQDN"
+        fi
+        # Drop any cert-manager Certificate left from a previous letsencrypt run so it cannot overwrite this secret.
+        kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        kubectl create secret tls "$TLS_SECRET" --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
+        rm -f tls.crt tls.key
+
     - name: Deploy Application using Helm on AKS
       if: ${{ github.event.inputs.action == 'deploy' }}
+      env:
+        FQDN: ${{ steps.aks.outputs.fqdn }}
       run: |
         helm upgrade --install nfs-server ./nfsserverChart
         kubectl rollout status deployment nfs-server-depl --timeout=180s
@@ -218,8 +367,23 @@ jobs:
           exit 1
         fi
         echo "NFS ClusterIP: $NFS_CIP"
+
+        TLS_ARGS=()
+        if [[ "$TLS_MODE" != "none" ]]; then
+          # hosts[1] is empty: a host-less rule keeps the app reachable over HTTP on the bare IP.
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$FQDN" --set "global.ingress.hosts[1]="
+                     --set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
+          case "$TLS_MODE" in
+            letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
+            letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
+          esac
+        else
+          kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        fi
+
         helm upgrade --install master-chart ./masterChart \
           -f ./masterChart/values-azure.yaml \
+          "${TLS_ARGS[@]}" \
           --set pv-chart.nfsCIP="$NFS_CIP" \
           --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
           --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
@@ -233,34 +397,66 @@ jobs:
           }
         done
 
-    - name: Retrieve Ingress public IP
-      if: ${{ github.event.inputs.action == 'deploy' }}
+    - name: Wait for Let's Encrypt certificate
+      if: ${{ github.event.inputs.action == 'deploy' && startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
       run: |
-        for i in {1..60}; do
-          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          if [[ -n "$IP" ]]; then
-            echo "================================================"
-            echo "Deployment Successful on AKS!"
-            echo "  External IP : $IP"
-            echo "  Image tag   : ${{ steps.resolve_tag.outputs.tag }}"
-            echo "  Gallery URL : http://$IP/"
-            echo "  Upload URL  : http://$IP/upload"
-            echo "================================================"
-            {
-              echo "### Crack detection deployed to AKS"
-              echo ""
-              echo "- Gallery: http://$IP/"
-              echo "- Upload: http://$IP/upload"
-              echo "- Image tag: \`${{ steps.resolve_tag.outputs.tag }}\`"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "Waiting for LoadBalancer IP... (attempt $i/60)"
-          sleep 5
+        # cert-manager creates the Certificate from the ingress annotation a few seconds after deploy.
+        for i in {1..30}; do
+          kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && break
+          sleep 2
         done
-        echo "::error::Failed to retrieve ingress public IP"
-        kubectl get svc -n ingress-nginx || true
-        exit 1
+        if ! kubectl wait --for=condition=Ready "certificate/$TLS_SECRET" --timeout=10m; then
+          echo "::error::Certificate was not issued. cert-manager diagnostics:"
+          kubectl describe certificate "$TLS_SECRET" || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          exit 1
+        fi
+        kubectl get certificate "$TLS_SECRET"
+
+    - name: Verify and summarize deployment
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      env:
+        IP: ${{ steps.ingress.outputs.ip }}
+        FQDN: ${{ steps.aks.outputs.fqdn }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        if [[ "$TLS_MODE" == "none" ]]; then
+          BASE="http://$FQDN"
+        else
+          BASE="https://$FQDN"
+          if [[ "$TLS_MODE" == "letsencrypt" ]]; then
+            # Real certificate: the HTTPS request must pass normal certificate verification.
+            if ! curl -sS -o /dev/null --retry 5 --retry-delay 5 --retry-all-errors "$BASE/"; then
+              echo "::error::HTTPS check against $BASE failed"
+              exit 1
+            fi
+            echo "HTTPS verified with a trusted certificate."
+          else
+            echo "::notice::$TLS_MODE certificate is not publicly trusted - browsers without the matching root CA will warn."
+          fi
+          echo "Served certificate:"
+          echo | openssl s_client -connect "$IP:443" -servername "$FQDN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
+        fi
+        echo "================================================"
+        echo "Deployment Successful on AKS!"
+        echo "  External IP : $IP"
+        echo "  Domain      : $FQDN"
+        echo "  TLS mode    : $TLS_MODE"
+        echo "  Image tag   : $TAG"
+        echo "  Gallery URL : $BASE/"
+        echo "  Upload URL  : $BASE/upload"
+        echo "  (plain IP)  : http://$IP/"
+        echo "================================================"
+        {
+          echo "### Crack detection deployed to AKS"
+          echo ""
+          echo "- Gallery: $BASE/"
+          echo "- Upload: $BASE/upload"
+          echo "- Plain IP (HTTP): http://$IP/"
+          echo "- TLS mode: \`$TLS_MODE\`"
+          echo "- Image tag: \`$TAG\`"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Uninstall Application from AKS
       if: ${{ github.event.inputs.action == 'uninstall' }}
@@ -268,6 +464,9 @@ jobs:
         helm uninstall master-chart --wait || true
         helm uninstall nfs-server --wait || true
         helm uninstall ingress-nginx -n ingress-nginx --wait || true
+        kubectl delete secret "$TLS_SECRET" --ignore-not-found=true || true
+        kubectl delete clusterissuer letsencrypt-prod letsencrypt-staging --ignore-not-found=true 2>/dev/null || true
+        helm uninstall cert-manager -n cert-manager --wait || true
         kubectl delete pv concrete-images-pv-nfs mypvc --ignore-not-found=true || true
         echo "Remaining resources:"
         kubectl get all -A | grep -v kube-system || true
