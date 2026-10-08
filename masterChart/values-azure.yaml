@@ -1,8 +1,15 @@
 global:
   provider: azure
   # Ingress served by the ingress-nginx controller installed by the AKS deploy workflow.
-  # Leave hosts empty to serve the app on the controller's public IP (no DNS/SSL yet).
-  # To use a domain later, list it here, e.g. hosts: ["aks.example.com"].
+  # The workflow sets hosts to the Azure-provided name <dns_label>.<region>.cloudapp.azure.com.
+  # Leave hosts empty to serve the app on the controller's public IP only (HTTP).
   ingress:
     className: nginx
     hosts: []
+    tls:
+      # When enabled, the ingress serves HTTPS for every entry in hosts using secretName.
+      enabled: false
+      secretName: concrete-gallery-tls
+      # cert-manager ClusterIssuer that fills secretName (e.g. letsencrypt-prod).
+      # Leave empty when the secret is created another way (e.g. mkcert).
+      clusterIssuer: ""

@@ -1,17 +1,34 @@
 {{- if eq (default "gcp" .Values.global.provider) "azure" }}
+{{- $ing := .Values.global.ingress | default dict }}
+{{- $tls := $ing.tls | default dict }}
+{{- $hosts := $ing.hosts | default (list "") }}
+{{- $annotations := $ing.annotations | default dict }}
+{{- if $tls.clusterIssuer }}
+{{- $annotations = merge (dict "cert-manager.io/cluster-issuer" $tls.clusterIssuer) $annotations }}
+{{- end }}
+{{- if and $tls.enabled (not (compact $hosts)) }}
+{{- fail "global.ingress.tls.enabled requires at least one entry in global.ingress.hosts" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: concrete-gallery-ingress
   namespace: default
-  {{- with .Values.global.ingress.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  ingressClassName: {{ default "nginx" .Values.global.ingress.className | quote }}
+  ingressClassName: {{ default "nginx" $ing.className | quote }}
+  {{- if $tls.enabled }}
+  tls:
+    - hosts:
+        {{- range compact $hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ default "concrete-gallery-tls" $tls.secretName | quote }}
+  {{- end }}
   rules:
-    {{- $hosts := .Values.global.ingress.hosts | default (list "") }}
     {{- range $hosts }}
     - http:
         paths:
