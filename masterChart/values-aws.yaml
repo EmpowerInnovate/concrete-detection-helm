@@ -1,0 +1,16 @@
+global:
+  provider: aws
+  # Ingress served by the ingress-nginx controller installed by the EKS deploy workflow,
+  # behind an AWS Network Load Balancer. The workflow sets hosts to the app domain
+  # (your own domain, or <nlb-ip>.sslip.io by default).
+  # Leave hosts empty to serve the app on the load balancer address only (HTTP).
+  ingress:
+    className: nginx
+    hosts: []
+    tls:
+      # When enabled, the ingress serves HTTPS for every entry in hosts using secretName.
+      enabled: false
+      secretName: concrete-gallery-tls
+      # cert-manager ClusterIssuer that fills secretName (e.g. letsencrypt-prod).
+      # Leave empty when the secret is created another way (e.g. mkcert).
+      clusterIssuer: ""
