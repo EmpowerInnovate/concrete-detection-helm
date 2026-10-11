@@ -1,4 +1,4 @@
-{{- if eq (default "gcp" .Values.global.provider) "azure" }}
+{{- if has (default "gcp" .Values.global.provider) (list "azure" "aws") }}
 {{- $ing := .Values.global.ingress | default dict }}
 {{- $tls := $ing.tls | default dict }}
 {{- $hosts := $ing.hosts | default (list "") }}

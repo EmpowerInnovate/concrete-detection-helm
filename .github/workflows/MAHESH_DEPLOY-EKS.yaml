@@ -1,0 +1,511 @@
+name: Mahesh-EKS-deploy crack detection
+
+# Triggered manually from the GitHub Actions tab.
+# Deploys the crack-detection app to an EKS cluster created by the
+# "Deploy Kubernetes Cluster" workflow (provider = aws) in concrete-detection-infra.
+# The app is exposed through an ingress-nginx controller behind an AWS Network Load Balancer.
+# NLB IPs stay fixed for the life of the load balancer, so the app domain is either:
+#   - your own domain (input "domain"), pointed at the NLB with a CNAME record, or
+#   - left blank: a free wildcard-DNS name <nlb-ip-with-dashes>.sslip.io
+# The NLB address keeps serving HTTP.
+#
+# SSL (tls_mode):
+#   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
+#   letsencrypt-staging - same, against Let's Encrypt's staging CA (untrusted cert, no rate
+#                         limits) - use it to test issuance before switching to letsencrypt
+#   mkcert              - certificate generated locally with mkcert, read from the repository
+#                         secrets EKS_TLS_CERT / EKS_TLS_KEY (PEM). Trusted only on machines
+#                         that have the mkcert root CA installed
+#   none                - HTTP only
+# The optional repository secret LETSENCRYPT_EMAIL registers the ACME account with an email.
+#
+# Images: by default this workflow builds all three images from this commit and
+# pushes them to Docker Hub under a dedicated EKS tag series (eks-1.0.N, plus
+# eks-latest), then deploys exactly that tag. The eks- prefix keeps these builds
+# separate from the aks- and 1.x.y tags used by the other clouds.
+#
+# Credentials: if aws_access_key_id / aws_secret_access_key are left blank, the
+# repository secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are used instead.
+# The IAM identity must have access to the cluster. The infra workflow grants
+# cluster-admin to the identity that created the cluster, so the same deployer
+# IAM user works without extra setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy = install/upgrade the app | uninstall = remove the app, ingress controller (and its NLB) and cert-manager"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - uninstall
+      aws_access_key_id:
+        description: "[AWS] Access Key ID (leave blank to use secrets.AWS_ACCESS_KEY_ID)"
+        required: false
+        type: string
+      aws_secret_access_key:
+        description: "[AWS] Secret Access Key (leave blank to use secrets.AWS_SECRET_ACCESS_KEY)"
+        required: false
+        type: string
+      aws_region:
+        description: "[AWS] Region of the EKS cluster"
+        required: true
+        default: "us-east-1"
+        type: string
+      eks_cluster_name:
+        description: "[AWS] EKS cluster name"
+        required: true
+        default: "crack-detection-cluster"
+        type: string
+      build_images:
+        description: "Build and push new EKS images (eks-1.0.N) from this commit and deploy them. Uncheck to deploy an existing tag instead."
+        required: true
+        default: true
+        type: boolean
+      image_tag:
+        description: 'Used only when build_images is unchecked: tag to deploy ("auto" = latest eks-1.x.y tag, or an explicit tag e.g. eks-1.0.3)'
+        required: true
+        default: "auto"
+        type: string
+      domain:
+        description: "App domain. Leave blank for a free <nlb-ip>.sslip.io name, or enter your own (e.g. eks.example.com) and CNAME it to the NLB hostname the run prints"
+        required: false
+        type: string
+      tls_mode:
+        description: "SSL certificate source"
+        required: true
+        default: "letsencrypt"
+        type: choice
+        options:
+          - letsencrypt
+          - letsencrypt-staging
+          - mkcert
+          - none
+
+jobs:
+  EKS-deploy-concrete-detection:
+    name: EKS-deploy-concrete-detection
+    runs-on: ubuntu-latest
+    env:
+      TLS_MODE: ${{ github.event.inputs.tls_mode }}
+      TLS_SECRET: concrete-gallery-tls
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Print input parameters
+      run: |
+        echo "================================================"
+        echo "  Pipeline Input Parameters"
+        echo "================================================"
+        echo "  action               : ${{ github.event.inputs.action }}"
+        echo "  aws_access_key_id    : ${{ github.event.inputs.aws_access_key_id != '' && 'provided' || 'NOT provided (using secrets)' }}"
+        echo "  aws_secret_access_key: ${{ github.event.inputs.aws_secret_access_key != '' && 'provided' || 'NOT provided (using secrets)' }}"
+        echo "  aws_region           : ${{ github.event.inputs.aws_region }}"
+        echo "  eks_cluster_name     : ${{ github.event.inputs.eks_cluster_name }}"
+        echo "  build_images         : ${{ github.event.inputs.build_images }}"
+        echo "  image_tag            : ${{ github.event.inputs.image_tag }}"
+        echo "  domain               : ${{ github.event.inputs.domain != '' && github.event.inputs.domain || '(blank -> <nlb-ip>.sslip.io)' }}"
+        echo "  tls_mode             : ${{ github.event.inputs.tls_mode }}"
+        echo "================================================"
+
+    - name: Log in to DockerHub
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        password: ${{ secrets.MAHESH_DOCKER_PASSWORD }}
+
+    - name: Resolve Docker Image Tag
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      id: resolve_tag
+      run: |
+        REPO="${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic"
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)
+        TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list" | jq -r '.tags[]' 2>/dev/null || true)
+        LATEST_EKS=$(echo "$TAGS" | grep -E '^eks-1\.[0-9]+\.[0-9]+$' | sed 's/^eks-//' | sort -V | tail -n 1 || true)
+
+        if [[ "${{ github.event.inputs.build_images }}" == "true" ]]; then
+          if [[ -z "$LATEST_EKS" ]]; then
+            NEXT="1.0.1"
+          else
+            IFS='.' read -r major minor patch <<< "$LATEST_EKS"
+            NEXT="${major}.${minor}.$((patch + 1))"
+          fi
+          TAG="eks-${NEXT}"
+          echo "New EKS build tag: $TAG"
+        else
+          INPUT_TAG="${{ github.event.inputs.image_tag }}"
+          if [[ "$INPUT_TAG" == "latest" || "$INPUT_TAG" == "auto" || -z "$INPUT_TAG" ]]; then
+            if [[ -z "$LATEST_EKS" ]]; then
+              echo "::error::No eks-1.x.y images found on Docker Hub. Run with build_images checked first."
+              exit 1
+            fi
+            TAG="eks-${LATEST_EKS}"
+            echo "Resolved latest EKS tag: $TAG"
+          else
+            TAG="$INPUT_TAG"
+            echo "Using specified tag: $TAG"
+          fi
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.build_images == 'true' }}
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push EKS images
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.build_images == 'true' }}
+      env:
+        REGISTRY: ${{ secrets.MAHESH_DOCKER_USERNAME }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        build_push() {
+          local dir="$1" image="$2"
+          echo "Building $REGISTRY/$image:$TAG from buildConcreteDetection/$dir ..."
+          docker build -f "buildConcreteDetection/$dir/dockerfile" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$REGISTRY/$image:$TAG" \
+            -t "$REGISTRY/$image:eks-latest" \
+            "buildConcreteDetection/$dir"
+          docker push "$REGISTRY/$image:$TAG"
+          docker push "$REGISTRY/$image:eks-latest"
+        }
+        build_push imageUpload          image-upload-logic
+        build_push crackDetection       crack-detection-logic
+        build_push concreteImageGallery concrete-image-gallery-logic
+        echo "Pushed EKS images with tag $TAG (commit $GITHUB_SHA)"
+
+    - name: Verify Docker images exist
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      run: |
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/image-upload-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/crack-detection-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+        docker manifest inspect ${{ secrets.MAHESH_DOCKER_USERNAME }}/concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }} > /dev/null
+
+    - name: Authenticate to AWS
+      env:
+        INPUT_ACCESS_KEY_ID: ${{ github.event.inputs.aws_access_key_id }}
+        INPUT_SECRET_ACCESS_KEY: ${{ github.event.inputs.aws_secret_access_key }}
+        SECRET_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        SECRET_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        REGION: ${{ github.event.inputs.aws_region }}
+      run: |
+        ACCESS_KEY_ID="${INPUT_ACCESS_KEY_ID:-$SECRET_ACCESS_KEY_ID}"
+        SECRET_ACCESS_KEY="${INPUT_SECRET_ACCESS_KEY:-$SECRET_SECRET_ACCESS_KEY}"
+        echo "::add-mask::$SECRET_ACCESS_KEY"
+        if [[ -z "$ACCESS_KEY_ID" || -z "$SECRET_ACCESS_KEY" ]]; then
+          echo "::error::AWS access key missing: provide it as inputs or set secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+          exit 1
+        fi
+        {
+          echo "AWS_ACCESS_KEY_ID=$ACCESS_KEY_ID"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET_ACCESS_KEY"
+          echo "AWS_REGION=$REGION"
+          echo "AWS_DEFAULT_REGION=$REGION"
+        } >> "$GITHUB_ENV"
+        export AWS_ACCESS_KEY_ID="$ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$SECRET_ACCESS_KEY" AWS_REGION="$REGION"
+        CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+        echo "AWS CLI authenticated as: $CALLER_ARN"
+
+    - name: Configure kubectl for EKS
+      run: |
+        CLUSTER_NAME="${{ github.event.inputs.eks_cluster_name }}"
+        echo "Fetching credentials for EKS cluster '$CLUSTER_NAME' in region '$AWS_REGION'..."
+        aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+        if ! kubectl get nodes; then
+          echo "::error::Cannot access the cluster. The IAM identity above needs an EKS access entry - use the IAM user that created the cluster, or add an access entry for this one (EKS console > Access)."
+          exit 1
+        fi
+
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Ensure NGINX Ingress Controller is installed (EKS)
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      id: ingress
+      env:
+        DOMAIN: ${{ github.event.inputs.domain }}
+      run: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        # aws-load-balancer-type=nlb: a Network Load Balancer, whose IPs stay fixed (a Classic ELB's change).
+        # Cross-zone load balancing lets any of the NLB's per-AZ IPs reach the controller pod.
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx --create-namespace \
+          --set-string controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb \
+          --set-string controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-cross-zone-load-balancing-enabled"=true \
+          --wait --timeout 10m
+        kubectl get svc ingress-nginx-controller -n ingress-nginx
+
+        LB_HOST=""
+        for i in {1..60}; do
+          LB_HOST=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          [[ -n "$LB_HOST" ]] && break
+          echo "Waiting for LoadBalancer hostname... (attempt $i/60)"
+          sleep 5
+        done
+        if [[ -z "$LB_HOST" ]]; then
+          echo "::error::Failed to retrieve the NLB hostname"
+          kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
+          exit 1
+        fi
+        echo "NLB hostname: $LB_HOST"
+        echo "lb_host=$LB_HOST" >> "$GITHUB_OUTPUT"
+
+        # A new NLB's DNS name takes a few minutes to start resolving.
+        LB_IPS=""
+        for i in {1..60}; do
+          LB_IPS=$(dig +short A "$LB_HOST" @1.1.1.1 | grep -E '^[0-9.]+$' | sort -V || true)
+          [[ -n "$LB_IPS" ]] && break
+          echo "Waiting for $LB_HOST to resolve... (attempt $i/60)"
+          sleep 10
+        done
+        if [[ -z "$LB_IPS" ]]; then
+          echo "::error::$LB_HOST did not resolve to any IP"
+          exit 1
+        fi
+        IP=$(echo "$LB_IPS" | head -n 1)
+        echo "NLB IPs: $(echo $LB_IPS)"
+        echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
+        if [[ -z "$DOMAIN" ]]; then
+          # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
+          FQDN="${IP//./-}.sslip.io"
+          echo "App domain: $FQDN"
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        FQDN="${DOMAIN,,}"
+        echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+        echo "::notice::Point your domain at the NLB: CNAME  $FQDN  ->  $LB_HOST"
+        # Let's Encrypt validates over this name, so it must resolve to the NLB before the certificate is requested.
+        for i in {1..60}; do
+          RESOLVED=$(dig +short A "$FQDN" @1.1.1.1 | grep -E '^[0-9.]+$' || true)
+          if [[ -n "$RESOLVED" ]] && grep -qxFf <(echo "$LB_IPS") <<< "$RESOLVED"; then
+            echo "DNS ready: $FQDN -> $(echo $RESOLVED)"
+            exit 0
+          fi
+          echo "Waiting for $FQDN to resolve to the NLB (got '$(echo ${RESOLVED:-nothing})')... (attempt $i/60)"
+          sleep 10
+        done
+        echo "::error::$FQDN does not resolve to the NLB. Create a CNAME record $FQDN -> $LB_HOST at your DNS provider and re-run."
+        exit 1
+
+    - name: Install cert-manager and Let's Encrypt issuers
+      if: ${{ github.event.inputs.action == 'deploy' && startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      env:
+        ACME_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 10m
+
+        issuer() {
+          local name="$1" server="$2"
+          cat <<YAML
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata:
+          name: ${name}
+        spec:
+          acme:
+            server: ${server}
+        ${ACME_EMAIL:+    email: ${ACME_EMAIL}}
+            privateKeySecretRef:
+              name: ${name}-account-key
+            solvers:
+              - http01:
+                  ingress:
+                    ingressClassName: nginx
+        ---
+        YAML
+        }
+        {
+          issuer letsencrypt-prod    https://acme-v02.api.letsencrypt.org/directory
+          issuer letsencrypt-staging https://acme-staging-v02.api.letsencrypt.org/directory
+        } > issuers.yaml
+        cat issuers.yaml
+
+        # The cert-manager webhook can take a few seconds to accept requests after install.
+        for i in {1..12}; do
+          kubectl apply -f issuers.yaml && break
+          echo "cert-manager webhook not ready yet, retrying... (attempt $i/12)"
+          sleep 10
+        done
+        kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod clusterissuer/letsencrypt-staging --timeout=120s
+
+    - name: Create TLS secret from mkcert certificate
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.tls_mode == 'mkcert' }}
+      env:
+        TLS_CERT: ${{ secrets.EKS_TLS_CERT }}
+        TLS_KEY: ${{ secrets.EKS_TLS_KEY }}
+        FQDN: ${{ steps.ingress.outputs.fqdn }}
+      run: |
+        if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+          echo "::error::tls_mode=mkcert needs repository secrets EKS_TLS_CERT and EKS_TLS_KEY (PEM contents of: mkcert $FQDN)"
+          exit 1
+        fi
+        printf '%s\n' "$TLS_CERT" > tls.crt
+        printf '%s\n' "$TLS_KEY" > tls.key
+        openssl x509 -in tls.crt -noout -subject -enddate
+        if ! openssl x509 -in tls.crt -noout -checkhost "$FQDN" | grep -q "does match"; then
+          echo "::warning::The mkcert certificate does not cover $FQDN - regenerate it with: mkcert $FQDN"
+        fi
+        # Drop any cert-manager Certificate left from a previous letsencrypt run so it cannot overwrite this secret.
+        kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        kubectl create secret tls "$TLS_SECRET" --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
+        rm -f tls.crt tls.key
+
+    - name: Deploy Application using Helm on EKS
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      env:
+        FQDN: ${{ steps.ingress.outputs.fqdn }}
+      run: |
+        helm upgrade --install nfs-server ./nfsserverChart
+        kubectl rollout status deployment nfs-server-depl --timeout=180s
+        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
+        if [[ -z "$NFS_CIP" ]]; then
+          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
+          exit 1
+        fi
+        echo "NFS ClusterIP: $NFS_CIP"
+
+        TLS_ARGS=()
+        if [[ "$TLS_MODE" != "none" ]]; then
+          # hosts[1] is empty: a host-less rule keeps the app reachable over HTTP on the NLB address.
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$FQDN" --set "global.ingress.hosts[1]="
+                     --set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
+          case "$TLS_MODE" in
+            letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
+            letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
+          esac
+        else
+          kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        fi
+
+        helm upgrade --install master-chart ./masterChart \
+          -f ./masterChart/values-aws.yaml \
+          "${TLS_ARGS[@]}" \
+          --set pv-chart.nfsCIP="$NFS_CIP" \
+          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
+          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
+        for d in image-upload-depl crack-detection-depl concrete-image-gallery-depl; do
+          kubectl rollout status deployment "$d" --timeout=300s || {
+            echo "::warning::Deployment $d did not become ready in time"
+            kubectl describe deployment "$d" | tail -20 || true
+            kubectl get pods -o wide || true
+          }
+        done
+
+    - name: Wait for Let's Encrypt certificate
+      if: ${{ github.event.inputs.action == 'deploy' && startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      run: |
+        # cert-manager creates the Certificate from the ingress annotation a few seconds after deploy.
+        for i in {1..30}; do
+          kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && break
+          sleep 2
+        done
+        if ! kubectl wait --for=condition=Ready "certificate/$TLS_SECRET" --timeout=10m; then
+          echo "::error::Certificate was not issued. cert-manager diagnostics:"
+          kubectl describe certificate "$TLS_SECRET" || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          exit 1
+        fi
+        kubectl get certificate "$TLS_SECRET"
+
+    - name: Verify and summarize deployment
+      if: ${{ github.event.inputs.action == 'deploy' }}
+      env:
+        IP: ${{ steps.ingress.outputs.ip }}
+        LB_HOST: ${{ steps.ingress.outputs.lb_host }}
+        FQDN: ${{ steps.ingress.outputs.fqdn }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        if [[ "$TLS_MODE" == "none" ]]; then
+          BASE="http://$FQDN"
+        else
+          BASE="https://$FQDN"
+          if [[ "$TLS_MODE" == "letsencrypt" ]]; then
+            # Real certificate: the HTTPS request must pass normal certificate verification.
+            # ingress-nginx needs a little time to pick up the freshly issued secret (it serves its
+            # self-signed default cert until then), so poll. --resolve pins the name to the NLB IP
+            # so the runner's DNS cache cannot interfere.
+            OK=""
+            for i in {1..36}; do
+              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$FQDN:443:$IP" "$BASE/" 2>&1); then
+                OK=1
+                break
+              fi
+              echo "HTTPS not ready yet (attempt $i/36): $ERR"
+              sleep 5
+            done
+            if [[ -z "$OK" ]]; then
+              echo "::error::HTTPS check against $BASE failed: $ERR"
+              exit 1
+            fi
+            echo "HTTPS verified with a trusted certificate."
+          else
+            echo "::notice::$TLS_MODE certificate is not publicly trusted - browsers without the matching root CA will warn."
+          fi
+          echo "Served certificate:"
+          echo | openssl s_client -connect "$IP:443" -servername "$FQDN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
+        fi
+        echo "================================================"
+        echo "Deployment Successful on EKS!"
+        echo "  NLB hostname: $LB_HOST"
+        echo "  NLB IP      : $IP"
+        echo "  Domain      : $FQDN"
+        echo "  TLS mode    : $TLS_MODE"
+        echo "  Image tag   : $TAG"
+        echo "  Gallery URL : $BASE/"
+        echo "  Upload URL  : $BASE/upload"
+        echo "  (plain NLB) : http://$LB_HOST/"
+        echo "================================================"
+        {
+          echo "### Crack detection deployed to EKS"
+          echo ""
+          echo "- Gallery: $BASE/"
+          echo "- Upload: $BASE/upload"
+          echo "- Plain NLB (HTTP): http://$LB_HOST/"
+          echo "- TLS mode: \`$TLS_MODE\`"
+          echo "- Image tag: \`$TAG\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Uninstall Application from EKS
+      if: ${{ github.event.inputs.action == 'uninstall' }}
+      run: |
+        LB_HOST=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        helm uninstall master-chart --wait || true
+        helm uninstall nfs-server --wait || true
+        helm uninstall ingress-nginx -n ingress-nginx --wait || true
+        kubectl delete secret "$TLS_SECRET" --ignore-not-found=true || true
+        kubectl delete clusterissuer letsencrypt-prod letsencrypt-staging --ignore-not-found=true 2>/dev/null || true
+        helm uninstall cert-manager -n cert-manager --wait || true
+        kubectl delete pv concrete-images-pv-nfs mypvc --ignore-not-found=true || true
+
+        # The NLB is deleted asynchronously; a leftover NLB blocks VPC deletion when the cluster is destroyed.
+        if [[ -n "$LB_HOST" ]]; then
+          for i in {1..30}; do
+            LEFT=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?DNSName=='$LB_HOST'].LoadBalancerName" --output text || true)
+            if [[ -z "$LEFT" || "$LEFT" == "None" ]]; then
+              echo "NLB $LB_HOST deleted."
+              break
+            fi
+            echo "Waiting for NLB $LEFT to be deleted... (attempt $i/30)"
+            sleep 10
+          done
+        fi
+        echo "Remaining resources:"
+        kubectl get all -A | grep -v kube-system || true
