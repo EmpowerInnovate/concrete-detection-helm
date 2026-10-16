@@ -1,9 +1,12 @@
 name: Mahesh-DO-SSL-deploy crack detection
 
 # Triggered manually from the GitHub Actions tab.
-# Deploys the crack-detection app to a DOKS cluster behind an ingress-nginx controller and
-# points the domain's A record (DigitalOcean DNS) at the controller's load balancer IP.
-# The bare IP keeps serving HTTP.
+# Deploys the crack-detection app to a DOKS cluster behind an ingress-nginx controller.
+# The app is served on a name built from the load balancer IP, so no domain is needed:
+#   <ip-with-dashes>.sslip.io  (e.g. 161-35-245-143.sslip.io; sslip.io resolves it to that IP)
+# Let's Encrypt does not issue normal certificates for a bare IP, hence the IP-based name.
+# Optionally set "domain" to a domain managed in DigitalOcean DNS instead; its A record (@)
+# is then pointed at the load balancer IP. The bare IP keeps serving HTTP.
 #
 # SSL (tls_mode):
 #   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
@@ -32,9 +35,8 @@ on:
         default: 'auto'
         type: string
       domain:
-        description: "Domain managed in DigitalOcean DNS; its A record (@) is pointed at the ingress IP"
-        required: true
-        default: "mahesh.concretecrackgallery.in"
+        description: "Leave blank to use the load balancer IP (<ip>.sslip.io). Or a domain managed in DigitalOcean DNS; its A record (@) is pointed at the IP"
+        required: false
         type: string
       tls_mode:
         description: "SSL certificate source"
@@ -68,7 +70,7 @@ jobs:
         echo "  do_cluster_name : ${{ github.event.inputs.do_cluster_name }}"
         echo "  do_token        : ${{ github.event.inputs.do_token != '' && '*** provided ***' || 'NOT provided' }}"
         echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
-        echo "  domain          : ${{ github.event.inputs.domain }}"
+        echo "  domain          : ${{ github.event.inputs.domain != '' && github.event.inputs.domain || '(blank -> <ip>.sslip.io)' }}"
         echo "  tls_mode        : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
@@ -142,6 +144,10 @@ jobs:
           if [[ -n "$IP" ]]; then
             echo "Retrieved Ingress IP: $IP"
             echo "ingressIp=$IP" >> "$GITHUB_OUTPUT"
+            # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
+            FQDN="${DOMAIN:-${IP//./-}.sslip.io}"
+            echo "App domain: $FQDN"
+            echo "FQDN=$FQDN" >> "$GITHUB_ENV"
             exit 0
           fi
           echo "Waiting for LoadBalancer IP to be assigned... (attempt $i/60)"
@@ -154,6 +160,7 @@ jobs:
     # DNS must point at the new IP before cert-manager requests the certificate:
     # Let's Encrypt validates by fetching http://<domain>/.well-known/acme-challenge/...
     - name: Update DNS Records with Ingress IP
+      if: ${{ github.event.inputs.domain != '' }}
       env:
         TTL: 300
       run: |
@@ -254,14 +261,14 @@ jobs:
         TLS_KEY: ${{ secrets.DO_TLS_KEY }}
       run: |
         if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
-          echo "::error::tls_mode=mkcert needs repository secrets DO_TLS_CERT and DO_TLS_KEY (PEM contents of: mkcert $DOMAIN)"
+          echo "::error::tls_mode=mkcert needs repository secrets DO_TLS_CERT and DO_TLS_KEY (PEM contents of: mkcert $FQDN)"
           exit 1
         fi
         printf '%s\n' "$TLS_CERT" > tls.crt
         printf '%s\n' "$TLS_KEY" > tls.key
         openssl x509 -in tls.crt -noout -subject -enddate
-        if ! openssl x509 -in tls.crt -noout -checkhost "$DOMAIN" | grep -q "does match"; then
-          echo "::warning::The mkcert certificate does not cover $DOMAIN - regenerate it with: mkcert $DOMAIN"
+        if ! openssl x509 -in tls.crt -noout -checkhost "$FQDN" | grep -q "does match"; then
+          echo "::warning::The mkcert certificate does not cover $FQDN - regenerate it with: mkcert $FQDN"
         fi
         # Drop any cert-manager Certificate left from a previous letsencrypt run so it cannot overwrite this secret.
         kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
@@ -282,14 +289,21 @@ jobs:
         TLS_ARGS=()
         if [[ "$TLS_MODE" != "none" ]]; then
           # hosts[1] is empty: a host-less rule keeps the app reachable over HTTP on the bare IP.
-          TLS_ARGS+=(--set "global.ingress.hosts[0]=$DOMAIN" --set "global.ingress.hosts[1]="
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$FQDN" --set "global.ingress.hosts[1]="
                      --set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
+          # A Certificate left from a run with another name may sit in cert-manager's failure
+          # backoff (up to hours); delete it so the ingress recreates it for this name right away.
+          OLD_NAME=$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.spec.dnsNames[0]}' 2>/dev/null || true)
+          if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$FQDN" ]]; then
+            echo "Deleting Certificate for previous name $OLD_NAME"
+            kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
+          fi
           case "$TLS_MODE" in
             letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
             letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
           esac
         else
-          TLS_ARGS+=(--set "global.ingress.hosts[0]=$DOMAIN" --set "global.ingress.hosts[1]=")
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$FQDN" --set "global.ingress.hosts[1]=")
           kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
         fi
 
@@ -332,9 +346,9 @@ jobs:
         TAG: ${{ steps.resolve_tag.outputs.tag }}
       run: |
         if [[ "$TLS_MODE" == "none" ]]; then
-          BASE="http://$DOMAIN"
+          BASE="http://$FQDN"
         else
-          BASE="https://$DOMAIN"
+          BASE="https://$FQDN"
           if [[ "$TLS_MODE" == "letsencrypt" ]]; then
             # Real certificate: the HTTPS request must pass normal certificate verification.
             # ingress-nginx needs a little time to pick up the freshly issued secret (it serves its
@@ -342,7 +356,7 @@ jobs:
             # so the runner's DNS cache cannot interfere.
             OK=""
             for i in {1..36}; do
-              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$DOMAIN:443:$IP" "$BASE/" 2>&1); then
+              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$FQDN:443:$IP" "$BASE/" 2>&1); then
                 OK=1
                 break
               fi
@@ -358,11 +372,11 @@ jobs:
             echo "::notice::$TLS_MODE certificate is not publicly trusted - browsers without the matching root CA will warn."
           fi
           echo "Served certificate:"
-          echo | openssl s_client -connect "$IP:443" -servername "$DOMAIN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
+          echo | openssl s_client -connect "$IP:443" -servername "$FQDN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
         fi
         echo "================================================"
         echo "Deployment & DNS Update Successful!"
-        echo "  Domain      : $DOMAIN"
+        echo "  Domain      : $FQDN"
         echo "  External IP : $IP"
         echo "  TLS mode    : $TLS_MODE"
         echo "  Image tag   : $TAG"

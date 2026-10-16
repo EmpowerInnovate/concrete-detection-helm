@@ -1,8 +1,8 @@
 global:
   provider: digitalocean
   # Ingress served by the ingress-nginx controller installed by the DO deploy workflow.
-  # The workflow sets hosts to the app domain (default mahesh.concretecrackgallery.in),
-  # whose A record it points at the controller's load balancer IP.
+  # The workflow sets hosts to <load-balancer-ip>.sslip.io, or to the domain input
+  # (whose A record it points at the controller's load balancer IP).
   # Leave hosts empty to serve the app on the load balancer IP only (HTTP).
   ingress:
     className: nginx
