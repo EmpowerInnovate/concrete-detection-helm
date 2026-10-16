@@ -1,10 +1,16 @@
 global:
   provider: digitalocean
-  domainName: mahesh.concretecrackgallery.in
-  certSecretName: concrete-gallery-tls
+  # Ingress served by the ingress-nginx controller installed by the DO deploy workflow.
+  # The workflow sets hosts to the app domain (default mahesh.concretecrackgallery.in),
+  # whose A record it points at the controller's load balancer IP.
+  # Leave hosts empty to serve the app on the load balancer IP only (HTTP).
   ingress:
     className: nginx
-    annotations:
-      kubernetes.io/ingress.class: "nginx"
-
-
+    hosts: []
+    tls:
+      # When enabled, the ingress serves HTTPS for every entry in hosts using secretName.
+      enabled: false
+      secretName: concrete-gallery-tls
+      # cert-manager ClusterIssuer that fills secretName (e.g. letsencrypt-prod).
+      # Leave empty when the secret is created another way (e.g. mkcert).
+      clusterIssuer: ""

@@ -1,6 +1,19 @@
-name: Mahesh-DO-SSL-deploy crack detection 
+name: Mahesh-DO-SSL-deploy crack detection
 
-# Triggered manually from the GitHub Actions tab
+# Triggered manually from the GitHub Actions tab.
+# Deploys the crack-detection app to a DOKS cluster behind an ingress-nginx controller and
+# points the domain's A record (DigitalOcean DNS) at the controller's load balancer IP.
+# The bare IP keeps serving HTTP.
+#
+# SSL (tls_mode):
+#   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
+#   letsencrypt-staging - same, against Let's Encrypt's staging CA (untrusted cert, no rate
+#                         limits) - use it to test issuance before switching to letsencrypt
+#   mkcert              - certificate generated locally with mkcert, read from the repository
+#                         secrets DO_TLS_CERT / DO_TLS_KEY (PEM). Trusted only on machines
+#                         that have the mkcert root CA installed
+#   none                - HTTP only
+# The optional repository secret LETSENCRYPT_EMAIL registers the ACME account with an email.
 
 on:
   workflow_dispatch:
@@ -18,15 +31,34 @@ on:
         required: true
         default: 'auto'
         type: string
+      domain:
+        description: "Domain managed in DigitalOcean DNS; its A record (@) is pointed at the ingress IP"
+        required: true
+        default: "mahesh.concretecrackgallery.in"
+        type: string
+      tls_mode:
+        description: "SSL certificate source"
+        required: true
+        default: "letsencrypt"
+        type: choice
+        options:
+          - letsencrypt
+          - letsencrypt-staging
+          - mkcert
+          - none
 
 jobs:
   DO-SSL-deploy-concrete-detection:
     name: DO-SSL-deploy-concrete-detection
     runs-on: ubuntu-latest
+    env:
+      TLS_MODE: ${{ github.event.inputs.tls_mode }}
+      TLS_SECRET: concrete-gallery-tls
+      DOMAIN: ${{ github.event.inputs.domain }}
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Print input parameters
       run: |
@@ -36,6 +68,8 @@ jobs:
         echo "  do_cluster_name : ${{ github.event.inputs.do_cluster_name }}"
         echo "  do_token        : ${{ github.event.inputs.do_token != '' && '*** provided ***' || 'NOT provided' }}"
         echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
+        echo "  domain          : ${{ github.event.inputs.domain }}"
+        echo "  tls_mode        : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
     - name: Log in to DockerHub
@@ -85,65 +119,42 @@ jobs:
 
     - name: Ensure NGINX Ingress Controller is installed and configured
       run: |
-        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/do/deploy.yaml
-        sleep 3
-        kubectl patch configmap ingress-nginx-controller -n ingress-nginx --type merge -p '{"data":{"use-proxy-protocol":"false"}}' || true
-        kubectl rollout restart deployment ingress-nginx-controller -n ingress-nginx || true
-        kubectl rollout status deployment ingress-nginx-controller -n ingress-nginx --timeout=120s || true
+        # The DO manifest enables PROXY protocol on both the load balancer and nginx. Turn it off on
+        # both sides: with it on, in-cluster requests to the LB IP (cert-manager's HTTP-01 self-check)
+        # reach nginx without the PROXY header and fail, so Let's Encrypt never issues.
+        curl -sSL https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/do/deploy.yaml \
+          | sed -e 's/use-proxy-protocol: "true"/use-proxy-protocol: "false"/' \
+                -e 's/do-loadbalancer-enable-proxy-protocol: "true"/do-loadbalancer-enable-proxy-protocol: "false"/' \
+          > ingress-nginx-do.yaml
+        grep -n 'proxy-protocol' ingress-nginx-do.yaml
+        kubectl apply -f ingress-nginx-do.yaml
+        # Restart so a controller started with the old ConfigMap drops PROXY protocol.
+        kubectl rollout restart deployment ingress-nginx-controller -n ingress-nginx
+        kubectl rollout status deployment ingress-nginx-controller -n ingress-nginx --timeout=180s
         kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
         kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
-
-    - name: Deploy Application using Helm on DigitalOcean
-      run: |
-        kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
-        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
-        helm upgrade --install nfs-server ./nfsserverChart
-        sleep 3
-        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
-        if [[ -z "$NFS_CIP" ]]; then
-          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
-          exit 1
-        fi
-        echo "NFS ClusterIP: $NFS_CIP"
-        kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found=true || true
-        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=ingress-nginx --ignore-not-found=true || true
-        helm upgrade --install master-chart ./masterChart \
-          -f ./masterChart/values-digitalocean.yaml \
-          --set pv-chart.nfsCIP="$NFS_CIP" \
-          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
-          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
-          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
-          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
-        sleep 5
 
     - name: Retrieve Ingress LoadBalancer IP
       id: ingress-ip
       run: |
-        # Wait for the LoadBalancer IP to be assigned (with timeout)
-        for i in {1..30}; do
-          IP=$(kubectl get ingress concrete-gallery-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          if [[ -z "$IP" ]]; then
-            IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          fi
-          if [[ -z "$IP" ]]; then
-            IP=$(kubectl get svc ingress-nginx-controller -n default -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          fi
+        for i in {1..60}; do
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
           if [[ -n "$IP" ]]; then
             echo "Retrieved Ingress IP: $IP"
-            echo "ingressIp=$IP" >> $GITHUB_OUTPUT
-            echo "::set-output name=ingressIp::$IP"
+            echo "ingressIp=$IP" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "Waiting for Ingress IP to be assigned... (attempt $i/30)"
+          echo "Waiting for LoadBalancer IP to be assigned... (attempt $i/60)"
           sleep 5
         done
-        echo "::error::Failed to retrieve Ingress IP after 30 attempts"
+        echo "::error::Failed to retrieve Ingress IP"
+        kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
         exit 1
 
+    # DNS must point at the new IP before cert-manager requests the certificate:
+    # Let's Encrypt validates by fetching http://<domain>/.well-known/acme-challenge/...
     - name: Update DNS Records with Ingress IP
       env:
-        DIGITALOCEAN_TOKEN: ${{ github.event.inputs.do_token || secrets.MAHESH_DIGITALOCEAN_ACCESS_TOKEN }}
-        DOMAIN: "mahesh.concretecrackgallery.in"
         TTL: 300
       run: |
         NEW_IP="${{ steps.ingress-ip.outputs.ingressIp }}"
@@ -151,14 +162,14 @@ jobs:
           echo "❌ Error: Ingress IP address is empty!"
           exit 1
         fi
-        
+
         echo "🔍 Fetching existing A record for $DOMAIN..."
         RECORD_INFO=$(doctl compute domain records list "$DOMAIN" --format ID,Type,Name,Data --no-header 2>/dev/null | awk '$2=="A" && ($3=="@" || $3=="") {print $1, $4}' || true)
-        
+
         if [[ -n "$RECORD_INFO" ]]; then
           RECORD_ID=$(echo "$RECORD_INFO" | awk '{print $1}')
           CURRENT_IP=$(echo "$RECORD_INFO" | awk '{print $2}')
-          
+
           if [[ "$CURRENT_IP" == "$NEW_IP" ]]; then
             echo "✅ The existing A record already points to $NEW_IP. No update needed."
           else
@@ -176,10 +187,195 @@ jobs:
           echo "✅ A record created!"
         fi
 
+        # Ask DigitalOcean's authoritative name server (what Let's Encrypt ends up seeing),
+        # so resolver caches holding the old IP don't matter.
+        for i in {1..30}; do
+          RESOLVED=$(dig +short A "$DOMAIN" @ns1.digitalocean.com | tail -n 1)
+          if [[ "$RESOLVED" == "$NEW_IP" ]]; then
+            echo "DNS ready: $DOMAIN -> $NEW_IP"
+            exit 0
+          fi
+          echo "Waiting for $DOMAIN to resolve to $NEW_IP (got '${RESOLVED:-nothing}')... (attempt $i/30)"
+          sleep 10
+        done
+        echo "::error::$DOMAIN does not resolve to $NEW_IP on ns1.digitalocean.com"
+        exit 1
+
+    - name: Install cert-manager and Let's Encrypt issuers
+      if: ${{ startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      env:
+        ACME_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 10m
+
+        issuer() {
+          local name="$1" server="$2"
+          cat <<YAML
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata:
+          name: ${name}
+        spec:
+          acme:
+            server: ${server}
+        ${ACME_EMAIL:+    email: ${ACME_EMAIL}}
+            privateKeySecretRef:
+              name: ${name}-account-key
+            solvers:
+              - http01:
+                  ingress:
+                    ingressClassName: nginx
+        ---
+        YAML
+        }
+        {
+          issuer letsencrypt-prod    https://acme-v02.api.letsencrypt.org/directory
+          issuer letsencrypt-staging https://acme-staging-v02.api.letsencrypt.org/directory
+        } > issuers.yaml
+        cat issuers.yaml
+
+        # The cert-manager webhook can take a few seconds to accept requests after install.
+        for i in {1..12}; do
+          kubectl apply -f issuers.yaml && break
+          echo "cert-manager webhook not ready yet, retrying... (attempt $i/12)"
+          sleep 10
+        done
+        kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod clusterissuer/letsencrypt-staging --timeout=120s
+
+    - name: Create TLS secret from mkcert certificate
+      if: ${{ github.event.inputs.tls_mode == 'mkcert' }}
+      env:
+        TLS_CERT: ${{ secrets.DO_TLS_CERT }}
+        TLS_KEY: ${{ secrets.DO_TLS_KEY }}
+      run: |
+        if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+          echo "::error::tls_mode=mkcert needs repository secrets DO_TLS_CERT and DO_TLS_KEY (PEM contents of: mkcert $DOMAIN)"
+          exit 1
+        fi
+        printf '%s\n' "$TLS_CERT" > tls.crt
+        printf '%s\n' "$TLS_KEY" > tls.key
+        openssl x509 -in tls.crt -noout -subject -enddate
+        if ! openssl x509 -in tls.crt -noout -checkhost "$DOMAIN" | grep -q "does match"; then
+          echo "::warning::The mkcert certificate does not cover $DOMAIN - regenerate it with: mkcert $DOMAIN"
+        fi
+        # Drop any cert-manager Certificate left from a previous letsencrypt run so it cannot overwrite this secret.
+        kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        kubectl create secret tls "$TLS_SECRET" --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
+        rm -f tls.crt tls.key
+
+    - name: Deploy Application using Helm on DigitalOcean
+      run: |
+        helm upgrade --install nfs-server ./nfsserverChart
+        kubectl rollout status deployment nfs-server-depl --timeout=180s
+        NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
+        if [[ -z "$NFS_CIP" ]]; then
+          echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
+          exit 1
+        fi
+        echo "NFS ClusterIP: $NFS_CIP"
+
+        TLS_ARGS=()
+        if [[ "$TLS_MODE" != "none" ]]; then
+          # hosts[1] is empty: a host-less rule keeps the app reachable over HTTP on the bare IP.
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$DOMAIN" --set "global.ingress.hosts[1]="
+                     --set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
+          case "$TLS_MODE" in
+            letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
+            letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
+          esac
+        else
+          TLS_ARGS+=(--set "global.ingress.hosts[0]=$DOMAIN" --set "global.ingress.hosts[1]=")
+          kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        fi
+
+        helm upgrade --install master-chart ./masterChart \
+          -f ./masterChart/values-digitalocean.yaml \
+          "${TLS_ARGS[@]}" \
+          --set pv-chart.nfsCIP="$NFS_CIP" \
+          --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
+          --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
+          --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
+        for d in image-upload-depl crack-detection-depl concrete-image-gallery-depl; do
+          kubectl rollout status deployment "$d" --timeout=300s || {
+            echo "::warning::Deployment $d did not become ready in time"
+            kubectl describe deployment "$d" | tail -20 || true
+            kubectl get pods -o wide || true
+          }
+        done
+
+    - name: Wait for Let's Encrypt certificate
+      if: ${{ startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      run: |
+        # cert-manager creates the Certificate from the ingress annotation a few seconds after deploy.
+        for i in {1..30}; do
+          kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && break
+          sleep 2
+        done
+        if ! kubectl wait --for=condition=Ready "certificate/$TLS_SECRET" --timeout=10m; then
+          echo "::error::Certificate was not issued. cert-manager diagnostics:"
+          kubectl describe certificate "$TLS_SECRET" || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          exit 1
+        fi
+        kubectl get certificate "$TLS_SECRET"
+
+    - name: Verify and summarize deployment
+      env:
+        IP: ${{ steps.ingress-ip.outputs.ingressIp }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        if [[ "$TLS_MODE" == "none" ]]; then
+          BASE="http://$DOMAIN"
+        else
+          BASE="https://$DOMAIN"
+          if [[ "$TLS_MODE" == "letsencrypt" ]]; then
+            # Real certificate: the HTTPS request must pass normal certificate verification.
+            # ingress-nginx needs a little time to pick up the freshly issued secret (it serves its
+            # self-signed default cert until then), so poll. --resolve pins the name to the ingress IP
+            # so the runner's DNS cache cannot interfere.
+            OK=""
+            for i in {1..36}; do
+              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$DOMAIN:443:$IP" "$BASE/" 2>&1); then
+                OK=1
+                break
+              fi
+              echo "HTTPS not ready yet (attempt $i/36): $ERR"
+              sleep 5
+            done
+            if [[ -z "$OK" ]]; then
+              echo "::error::HTTPS check against $BASE failed: $ERR"
+              exit 1
+            fi
+            echo "HTTPS verified with a trusted certificate."
+          else
+            echo "::notice::$TLS_MODE certificate is not publicly trusted - browsers without the matching root CA will warn."
+          fi
+          echo "Served certificate:"
+          echo | openssl s_client -connect "$IP:443" -servername "$DOMAIN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
+        fi
         echo "================================================"
         echo "Deployment & DNS Update Successful!"
         echo "  Domain      : $DOMAIN"
-        echo "  External IP : $NEW_IP"
-        echo "  Gallery URL : https://$DOMAIN/"
-        echo "  Upload URL  : https://$DOMAIN/upload"
+        echo "  External IP : $IP"
+        echo "  TLS mode    : $TLS_MODE"
+        echo "  Image tag   : $TAG"
+        echo "  Gallery URL : $BASE/"
+        echo "  Upload URL  : $BASE/upload"
+        echo "  (plain IP)  : http://$IP/"
         echo "================================================"
+        {
+          echo "### Crack detection deployed to DigitalOcean"
+          echo ""
+          echo "- Gallery: $BASE/"
+          echo "- Upload: $BASE/upload"
+          echo "- Plain IP (HTTP): http://$IP/"
+          echo "- TLS mode: \`$TLS_MODE\`"
+          echo "- Image tag: \`$TAG\`"
+        } >> "$GITHUB_STEP_SUMMARY"
