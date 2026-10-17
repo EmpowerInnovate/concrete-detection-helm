@@ -1,8 +1,7 @@
 global:
   provider: gcp
   # Ingress served by the ingress-nginx controller installed by the GKE deploy workflow,
-  # on a regional static IP. The workflow sets hosts to <static-ip>.sslip.io, or to the
-  # domain input (whose A record it points at the static IP in Cloud DNS).
+  # on a regional static IP. The workflow sets hosts to <static-ip>.sslip.io (no domain needed).
   # Leave hosts empty to serve the app on the static IP only (HTTP).
   # (className: gce renders the older GKE ingress + Google-managed certificate instead.)
   ingress:
