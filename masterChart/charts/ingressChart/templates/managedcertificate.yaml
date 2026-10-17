@@ -1,4 +1,4 @@
-{{- if eq (default "gcp" .Values.global.provider) "gcp" }}
+{{- if and (eq (default "gcp" .Values.global.provider) "gcp") (eq (dig "ingress" "className" "gce" .Values.global) "gce") }}
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
 metadata:
