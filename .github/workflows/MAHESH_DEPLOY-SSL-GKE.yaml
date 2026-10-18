@@ -1,6 +1,22 @@
-name: Mahesh-GKE-SSL-deploy crack detection 
+name: Mahesh-GKE-SSL-deploy crack detection
 
-# Triggered manually from the GitHub Actions tab
+# Triggered manually from the GitHub Actions tab.
+# Deploys the crack-detection app to a GKE cluster behind an ingress-nginx controller that
+# listens on a reserved regional static IP (concrete-detection-nginx-ip), so the IP survives redeploys.
+# There is no domain: the app is served on a name built from that IP,
+#   <ip-with-dashes>.sslip.io  (e.g. 34-123-45-67.sslip.io; sslip.io resolves it to that IP)
+# Let's Encrypt does not issue normal certificates for a bare IP, hence the IP-based name.
+# The bare IP keeps serving HTTP.
+#
+# SSL (tls_mode):
+#   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
+#   letsencrypt-staging - same, against Let's Encrypt's staging CA (untrusted cert, no rate
+#                         limits) - use it to test issuance before switching to letsencrypt
+#   mkcert              - certificate generated locally with mkcert, read from the repository
+#                         secrets GKE_TLS_CERT / GKE_TLS_KEY (PEM). Trusted only on machines
+#                         that have the mkcert root CA installed
+#   none                - HTTP only
+# The optional repository secret LETSENCRYPT_EMAIL registers the ACME account with an email.
 
 on:
   workflow_dispatch:
@@ -26,15 +42,30 @@ on:
         required: true
         default: 'auto'
         type: string
+      tls_mode:
+        description: "SSL certificate source"
+        required: true
+        default: "letsencrypt"
+        type: choice
+        options:
+          - letsencrypt
+          - letsencrypt-staging
+          - mkcert
+          - none
 
 jobs:
   GKE-SSL-deploy-concrete-detection:
     name: GKE-SSL-deploy-concrete-detection
     runs-on: ubuntu-latest
+    env:
+      TLS_MODE: ${{ github.event.inputs.tls_mode }}
+      TLS_SECRET: concrete-gallery-tls
+      GCP_PROJECT: ${{ github.event.inputs.gcp_project_id }}
+      IP_NAME: concrete-detection-nginx-ip
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Print input parameters
       run: |
@@ -46,6 +77,7 @@ jobs:
         echo "  gcp_cluster_zone: ${{ github.event.inputs.gcp_cluster_zone }}"
         echo "  gcp_sa_key_base64: ${{ github.event.inputs.gcp_sa_key_base64 != '' && '*** provided ***' || 'NOT provided' }}"
         echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
+        echo "  tls_mode        : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
     - name: Log in to DockerHub
@@ -91,102 +123,254 @@ jobs:
       run: |
         echo "$GCP_SA_KEY_BASE64" | tr -d '\n' | base64 -d > $HOME/gcp-key.json
         gcloud auth activate-service-account --key-file=$HOME/gcp-key.json
-        gcloud config set project ${{ github.event.inputs.gcp_project_id }}
+        gcloud config set project "$GCP_PROJECT"
         echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcp-key.json" >> $GITHUB_ENV
 
-    # Step 2: Install the gke-gcloud-auth-plugin using gcloud SDK
     - name: Install gke-gcloud-auth-plugin
       run: |
         gcloud components install gke-gcloud-auth-plugin
 
-    # Step 3: Configure kubectl to connect to the GKE cluster
     - name: Configure kubectl
       run: |
         gcloud container clusters get-credentials ${{ github.event.inputs.gcp_cluster_name }} \
         --zone ${{ github.event.inputs.gcp_cluster_zone }} \
-        --project ${{ github.event.inputs.gcp_project_id }}
+        --project "$GCP_PROJECT"
 
-    # Step 4: Install Helm directly
     - name: Install Helm
       run: |
         curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    
-    - name: Create global static IP (if not exists)
+
+    # ingress-nginx is exposed by a regional (network) load balancer, which needs a
+    # regional address - the old global concrete-detection-ip only works with the GKE ingress.
+    - name: Create regional static IP (if not exists)
+      id: static_ip
       run: |
-        IP_NAME="concrete-detection-ip"
-        GCP_PROJECT="${{ github.event.inputs.gcp_project_id }}"
-        echo "Checking if static IP '$IP_NAME' exists..."
-        EXISTING_IP=$(gcloud compute addresses describe $IP_NAME --global --project=$GCP_PROJECT --format="value(address)" 2>/dev/null || true)
-        if [[ -z "$EXISTING_IP" ]]; then
-          echo "Static IP not found, creating..."
-          gcloud compute addresses create $IP_NAME --global --project=$GCP_PROJECT
-        else
-          echo "Static IP already exists: $EXISTING_IP"
+        ZONE="${{ github.event.inputs.gcp_cluster_zone }}"
+        REGION="${ZONE%-*}"
+        IP=$(gcloud compute addresses describe "$IP_NAME" --region="$REGION" --project="$GCP_PROJECT" --format="value(address)" 2>/dev/null || true)
+        if [[ -z "$IP" ]]; then
+          echo "Static IP '$IP_NAME' not found in $REGION, creating..."
+          gcloud compute addresses create "$IP_NAME" --region="$REGION" --project="$GCP_PROJECT"
+          IP=$(gcloud compute addresses describe "$IP_NAME" --region="$REGION" --project="$GCP_PROJECT" --format="value(address)")
         fi
+        echo "Static IP: $IP ($REGION)"
+        echo "ip=$IP" >> "$GITHUB_OUTPUT"
+        # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
+        FQDN="${IP//./-}.sslip.io"
+        echo "App domain: $FQDN"
+        echo "FQDN=$FQDN" >> "$GITHUB_ENV"
+
+    - name: Ensure NGINX Ingress Controller is installed (GKE)
+      env:
+        IP: ${{ steps.static_ip.outputs.ip }}
+      run: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx --create-namespace \
+          --set controller.service.loadBalancerIP="$IP" \
+          --wait --timeout 10m
+        for i in {1..60}; do
+          LB_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          if [[ "$LB_IP" == "$IP" ]]; then
+            echo "Ingress controller is serving on $IP"
+            exit 0
+          fi
+          echo "Waiting for the load balancer to take $IP (got '${LB_IP:-nothing}')... (attempt $i/60)"
+          sleep 5
+        done
+        echo "::error::ingress-nginx did not get the static IP $IP"
+        kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
+        exit 1
+
+    - name: Install cert-manager and Let's Encrypt issuers
+      if: ${{ startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
+      env:
+        ACME_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 10m
+
+        issuer() {
+          local name="$1" server="$2"
+          cat <<YAML
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata:
+          name: ${name}
+        spec:
+          acme:
+            server: ${server}
+        ${ACME_EMAIL:+    email: ${ACME_EMAIL}}
+            privateKeySecretRef:
+              name: ${name}-account-key
+            solvers:
+              - http01:
+                  ingress:
+                    ingressClassName: nginx
+        ---
+        YAML
+        }
+        {
+          issuer letsencrypt-prod    https://acme-v02.api.letsencrypt.org/directory
+          issuer letsencrypt-staging https://acme-staging-v02.api.letsencrypt.org/directory
+        } > issuers.yaml
+        cat issuers.yaml
+
+        # The cert-manager webhook can take a few seconds to accept requests after install.
+        for i in {1..12}; do
+          kubectl apply -f issuers.yaml && break
+          echo "cert-manager webhook not ready yet, retrying... (attempt $i/12)"
+          sleep 10
+        done
+        kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod clusterissuer/letsencrypt-staging --timeout=120s
+
+    - name: Create TLS secret from mkcert certificate
+      if: ${{ github.event.inputs.tls_mode == 'mkcert' }}
+      env:
+        TLS_CERT: ${{ secrets.GKE_TLS_CERT }}
+        TLS_KEY: ${{ secrets.GKE_TLS_KEY }}
+      run: |
+        if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+          echo "::error::tls_mode=mkcert needs repository secrets GKE_TLS_CERT and GKE_TLS_KEY (PEM contents of: mkcert $FQDN)"
+          exit 1
+        fi
+        printf '%s\n' "$TLS_CERT" > tls.crt
+        printf '%s\n' "$TLS_KEY" > tls.key
+        openssl x509 -in tls.crt -noout -subject -enddate
+        if ! openssl x509 -in tls.crt -noout -checkhost "$FQDN" | grep -q "does match"; then
+          echo "::warning::The mkcert certificate does not cover $FQDN - regenerate it with: mkcert $FQDN"
+        fi
+        # Drop any cert-manager Certificate left from a previous letsencrypt run so it cannot overwrite this secret.
+        kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        kubectl create secret tls "$TLS_SECRET" --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
+        rm -f tls.crt tls.key
 
     - name: Deploy Application using Helm
       run: |
+        # An ingress from the old GKE-ingress setup owns a Google HTTP(S) load balancer. Delete it
+        # (its finalizer removes that load balancer) so helm recreates it as an nginx ingress.
+        OLD_CLASS=$(kubectl get ingress concrete-gallery-ingress -o jsonpath='{.spec.ingressClassName}' 2>/dev/null || true)
+        if [[ "$OLD_CLASS" == "gce" ]]; then
+          echo "Removing old GKE ingress and its Google load balancer..."
+          kubectl delete ingress concrete-gallery-ingress --wait=true --timeout=10m || true
+        fi
+
         helm upgrade --install nfs-server ./nfsserverChart
-        sleep 3
+        kubectl rollout status deployment nfs-server-depl --timeout=180s
         NFS_CIP=$(kubectl get svc nfs-server-svc-cip -o jsonpath='{.spec.clusterIP}')
         if [[ -z "$NFS_CIP" ]]; then
           echo "ERROR: could not discover nfs-server-svc-cip ClusterIP" >&2
           exit 1
         fi
         echo "NFS ClusterIP: $NFS_CIP"
+
+        # hosts[1] is empty: a host-less rule keeps the app reachable over HTTP on the bare IP.
+        TLS_ARGS=(--set "global.ingress.hosts[0]=$FQDN" --set "global.ingress.hosts[1]=")
+        if [[ "$TLS_MODE" != "none" ]]; then
+          TLS_ARGS+=(--set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
+          # A Certificate left from a run with another name may sit in cert-manager's failure
+          # backoff (up to hours); delete it so the ingress recreates it for this name right away.
+          OLD_NAME=$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.spec.dnsNames[0]}' 2>/dev/null || true)
+          if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$FQDN" ]]; then
+            echo "Deleting Certificate for previous name $OLD_NAME"
+            kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
+          fi
+          case "$TLS_MODE" in
+            letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
+            letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
+          esac
+        else
+          kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
+        fi
+
         helm upgrade --install master-chart ./masterChart \
           -f ./masterChart/values-gcp.yaml \
+          "${TLS_ARGS[@]}" \
           --set pv-chart.nfsCIP="$NFS_CIP" \
           --set global.registry="${{ secrets.MAHESH_DOCKER_USERNAME }}" \
           --set global.imageUploadImage="image-upload-logic:${{ steps.resolve_tag.outputs.tag }}" \
           --set global.crackDetectionImage="crack-detection-logic:${{ steps.resolve_tag.outputs.tag }}" \
           --set global.concreteGalleryImage="concrete-image-gallery-logic:${{ steps.resolve_tag.outputs.tag }}"
-        sleep 5
-        
-    - name: Wait for Ingress IP & Create/Update Cloud DNS A Record
+        for d in image-upload-depl crack-detection-depl concrete-image-gallery-depl; do
+          kubectl rollout status deployment "$d" --timeout=300s || {
+            echo "::warning::Deployment $d did not become ready in time"
+            kubectl describe deployment "$d" | tail -20 || true
+            kubectl get pods -o wide || true
+          }
+        done
+
+    - name: Wait for Let's Encrypt certificate
+      if: ${{ startsWith(github.event.inputs.tls_mode, 'letsencrypt') }}
       run: |
-        DOMAIN_NAME="maheshconcretegallery.online"
-        DNS_ZONE_NAME="concrete-zone-1"
-        TTL=300
-        GCP_PROJECT="${{ github.event.inputs.gcp_project_id }}"
-    
-        # Check if Cloud DNS managed zone exists
-        echo "Checking if DNS zone '$DNS_ZONE_NAME' exists..."
-        if ! gcloud dns managed-zones describe $DNS_ZONE_NAME --project=$GCP_PROJECT > /dev/null 2>&1; then
-          echo "DNS zone '$DNS_ZONE_NAME' not found. Creating..."
-          gcloud dns managed-zones create $DNS_ZONE_NAME \
-            --project=$GCP_PROJECT \
-            --description="Managed zone for crack detection" \
-            --dns-name="${DOMAIN_NAME}." \
-            --visibility="public"
+        # cert-manager creates the Certificate from the ingress annotation a few seconds after deploy.
+        for i in {1..30}; do
+          kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && break
+          sleep 2
+        done
+        if ! kubectl wait --for=condition=Ready "certificate/$TLS_SECRET" --timeout=10m; then
+          echo "::error::Certificate was not issued. cert-manager diagnostics:"
+          kubectl describe certificate "$TLS_SECRET" || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          exit 1
+        fi
+        kubectl get certificate "$TLS_SECRET"
+
+    - name: Verify and summarize deployment
+      env:
+        IP: ${{ steps.static_ip.outputs.ip }}
+        TAG: ${{ steps.resolve_tag.outputs.tag }}
+      run: |
+        if [[ "$TLS_MODE" == "none" ]]; then
+          BASE="http://$FQDN"
         else
-          echo "DNS zone '$DNS_ZONE_NAME' already exists."
+          BASE="https://$FQDN"
+          if [[ "$TLS_MODE" == "letsencrypt" ]]; then
+            # Real certificate: the HTTPS request must pass normal certificate verification.
+            # ingress-nginx needs a little time to pick up the freshly issued secret (it serves its
+            # self-signed default cert until then), so poll. --resolve pins the name to the static IP
+            # so the runner's DNS cache cannot interfere.
+            OK=""
+            for i in {1..36}; do
+              if ERR=$(curl -sS -o /dev/null --max-time 15 --resolve "$FQDN:443:$IP" "$BASE/" 2>&1); then
+                OK=1
+                break
+              fi
+              echo "HTTPS not ready yet (attempt $i/36): $ERR"
+              sleep 5
+            done
+            if [[ -z "$OK" ]]; then
+              echo "::error::HTTPS check against $BASE failed: $ERR"
+              exit 1
+            fi
+            echo "HTTPS verified with a trusted certificate."
+          else
+            echo "::notice::$TLS_MODE certificate is not publicly trusted - browsers without the matching root CA will warn."
+          fi
+          echo "Served certificate:"
+          echo | openssl s_client -connect "$IP:443" -servername "$FQDN" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate || true
         fi
-    
-        echo "Waiting for ingress IP to be provisioned..."
-        kubectl wait --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' ingress/concrete-gallery-ingress --timeout=600s
-        EXTERNAL_IP=$(kubectl get ingress concrete-gallery-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-        echo "Found Ingress IP: $EXTERNAL_IP"
-    
-        echo "Updating DNS record for $DOMAIN_NAME to $EXTERNAL_IP"
-    
-        # Check if existing A record exists
-        EXISTING=$(gcloud dns record-sets list \
-          --zone=$DNS_ZONE_NAME \
-          --name="${DOMAIN_NAME}." \
-          --type=A \
-          --format="value(rrdatas[0])")
-    
-        gcloud dns record-sets transaction start --zone=$DNS_ZONE_NAME
-    
-        if [[ -n "$EXISTING" ]]; then
-          echo "Removing old record: $EXISTING"
-          gcloud dns record-sets transaction remove "$EXISTING" \
-            --name="${DOMAIN_NAME}." --ttl=$TTL --type=A --zone=$DNS_ZONE_NAME
-        fi
-    
-        echo "Adding new A record: $EXTERNAL_IP"
-        gcloud dns record-sets transaction add "$EXTERNAL_IP" \
-          --name="${DOMAIN_NAME}." --ttl=$TTL --type=A --zone=$DNS_ZONE_NAME
-    
-        gcloud dns record-sets transaction execute --zone=$DNS_ZONE_NAME
+        echo "================================================"
+        echo "Deployment Successful on GKE!"
+        echo "  Static IP   : $IP"
+        echo "  Domain      : $FQDN"
+        echo "  TLS mode    : $TLS_MODE"
+        echo "  Image tag   : $TAG"
+        echo "  Gallery URL : $BASE/"
+        echo "  Upload URL  : $BASE/upload"
+        echo "  (plain IP)  : http://$IP/"
+        echo "================================================"
+        {
+          echo "### Crack detection deployed to GKE"
+          echo ""
+          echo "- Gallery: $BASE/"
+          echo "- Upload: $BASE/upload"
+          echo "- Plain IP (HTTP): http://$IP/"
+          echo "- TLS mode: \`$TLS_MODE\`"
+          echo "- Image tag: \`$TAG\`"
+        } >> "$GITHUB_STEP_SUMMARY"

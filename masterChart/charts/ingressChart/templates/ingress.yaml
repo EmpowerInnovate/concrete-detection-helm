@@ -1,4 +1,4 @@
-{{- if has (default "gcp" .Values.global.provider) (list "azure" "aws" "digitalocean") }}
+{{- if ne (dig "ingress" "className" "gce" .Values.global) "gce" }}
 {{- $ing := .Values.global.ingress | default dict }}
 {{- $tls := $ing.tls | default dict }}
 {{- $hosts := $ing.hosts | default (list "") }}

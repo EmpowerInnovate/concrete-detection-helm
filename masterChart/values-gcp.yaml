@@ -1,14 +1,16 @@
 global:
   provider: gcp
-  domainName: maheshconcretegallery.online
-  domains:
-    - mahesh.concretecrackgallery.online
-    - maheshconcretegallery.online
-  certName: concrete-gallery-cert
-  staticIpName: concrete-detection-ip
+  # Ingress served by the ingress-nginx controller installed by the GKE deploy workflow,
+  # on a regional static IP. The workflow sets hosts to <static-ip>.sslip.io (no domain needed).
+  # Leave hosts empty to serve the app on the static IP only (HTTP).
+  # (className: gce renders the older GKE ingress + Google-managed certificate instead.)
   ingress:
-    className: gce
-    annotations:
-      kubernetes.io/ingress.class: "gce"
-      networking.gke.io/managed-certificates: "concrete-gallery-cert"
-      kubernetes.io/ingress.global-static-ip-name: "concrete-detection-ip"
+    className: nginx
+    hosts: []
+    tls:
+      # When enabled, the ingress serves HTTPS for every entry in hosts using secretName.
+      enabled: false
+      secretName: concrete-gallery-tls
+      # cert-manager ClusterIssuer that fills secretName (e.g. letsencrypt-prod).
+      # Leave empty when the secret is created another way (e.g. mkcert).
+      clusterIssuer: ""
