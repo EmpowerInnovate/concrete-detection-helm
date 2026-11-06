@@ -1,0 +1,99 @@
+name: Mahesh-E2E Playwright crack detection
+
+# Triggered manually from the GitHub Actions tab, after a deploy.
+# Runs the Playwright suite in e2e/ against the deployed app:
+#   eks - https://crackdetectioneks.online
+#   aks - https://crackdetectionaks.online
+#   do  - https://crackdetectiondo.online
+# or against base_url when it is set (e.g. https://161-35-245-143.sslip.io).
+# Checks: trusted HTTPS certificate, HTTP -> HTTPS redirect, gallery and its images,
+# upload form, and (with "upload") a real upload that must show up in the gallery.
+# The HTML report is attached to the run as the "playwright-report" artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which deployment to test (ignored when base_url is set)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - eks
+          - aks
+          - do
+      base_url:
+        description: "Optional: test this URL instead (e.g. https://<ip>.sslip.io)"
+        required: false
+        type: string
+      upload:
+        description: "Upload a test image and wait for it in the gallery (it stays in the live gallery)"
+        required: false
+        default: false
+        type: boolean
+      allow_untrusted_tls:
+        description: "Accept untrusted certificates (letsencrypt-staging / mkcert deployments)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  e2e:
+    name: E2E-playwright-crack-detection
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e
+    env:
+      CI: "true"
+      BASE_URL: ${{ github.event.inputs.base_url }}
+      E2E_UPLOAD: ${{ github.event.inputs.upload == 'true' && '1' || '' }}
+      ALLOW_UNTRUSTED_TLS: ${{ github.event.inputs.allow_untrusted_tls == 'true' && '1' || '' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Print input parameters
+      run: |
+        echo "================================================"
+        echo "  Pipeline Input Parameters"
+        echo "================================================"
+        echo "  target              : ${{ github.event.inputs.target }}"
+        echo "  base_url            : ${{ github.event.inputs.base_url != '' && github.event.inputs.base_url || '(blank -> target domains)' }}"
+        echo "  upload              : ${{ github.event.inputs.upload }}"
+        echo "  allow_untrusted_tls : ${{ github.event.inputs.allow_untrusted_tls }}"
+        echo "================================================"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: e2e/package-lock.json
+
+    - name: Install Playwright
+      run: |
+        npm ci
+        npx playwright install --with-deps chromium
+
+    - name: Run Playwright tests
+      env:
+        TARGET: ${{ github.event.inputs.target }}
+      run: |
+        ARGS=()
+        if [[ -z "$BASE_URL" && "$TARGET" != "all" ]]; then
+          ARGS+=(--project="$TARGET")
+        fi
+        npx playwright test "${ARGS[@]}"
+
+    - name: Upload Playwright report
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-report
+        path: |
+          e2e/playwright-report/
+          e2e/test-results/
+        retention-days: 14

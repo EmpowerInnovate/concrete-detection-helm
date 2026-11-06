@@ -1,7 +1,8 @@
 global:
   provider: azure
   # Ingress served by the ingress-nginx controller installed by the AKS deploy workflow.
-  # The workflow sets hosts to the Azure-provided name <dns_label>.<region>.cloudapp.azure.com.
+  # The workflow sets hosts to the app domain (crackdetectionaks.online by default, or the
+  # Azure-provided name <dns_label>.<region>.cloudapp.azure.com when the domain input is cleared).
   # Leave hosts empty to serve the app on the controller's public IP only (HTTP).
   ingress:
     className: nginx

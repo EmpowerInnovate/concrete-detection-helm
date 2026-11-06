@@ -1,0 +1,15 @@
+{
+  "name": "concrete-detection-e2e",
+  "private": true,
+  "description": "Playwright checks against the deployed crack-detection app on each cloud's domain",
+  "scripts": {
+    "test": "playwright test",
+    "test:eks": "playwright test --project=eks",
+    "test:aks": "playwright test --project=aks",
+    "test:do": "playwright test --project=do",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
+  }
+}
