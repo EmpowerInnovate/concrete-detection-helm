@@ -3,8 +3,11 @@ name: Mahesh-GKE-SSL-deploy crack detection
 # Triggered manually from the GitHub Actions tab.
 # Deploys the crack-detection app to a GKE cluster behind an ingress-nginx controller that
 # listens on a reserved regional static IP (concrete-detection-nginx-ip), so the IP survives redeploys.
-# There is no domain: the app is served on a name built from that IP,
-#   <ip-with-dashes>.sslip.io  (e.g. 34-123-45-67.sslip.io; sslip.io resolves it to that IP)
+# The app is served on https://maheshconcretegallery.online/ by default (the "domain" input).
+# The domain is hosted in the Cloud DNS zone concrete-zone-1; its A record is pointed at the
+# static IP before the certificate is requested.
+# Clear the "domain" input to serve on a name built from the IP instead:
+#   <ip-with-dashes>.sslip.io  (sslip.io resolves it to that IP)
 # Let's Encrypt does not issue normal certificates for a bare IP, hence the IP-based name.
 # The bare IP keeps serving HTTP.
 #
@@ -42,6 +45,11 @@ on:
         required: true
         default: 'auto'
         type: string
+      domain:
+        description: "Domain in Cloud DNS zone concrete-zone-1; its A record is pointed at the static IP. Clear it to use <ip>.sslip.io"
+        required: false
+        default: "maheshconcretegallery.online"
+        type: string
       tls_mode:
         description: "SSL certificate source"
         required: true
@@ -60,8 +68,10 @@ jobs:
     env:
       TLS_MODE: ${{ github.event.inputs.tls_mode }}
       TLS_SECRET: concrete-gallery-tls
+      DOMAIN: ${{ github.event.inputs.domain }}
       GCP_PROJECT: ${{ github.event.inputs.gcp_project_id }}
       IP_NAME: concrete-detection-nginx-ip
+      DNS_ZONE_NAME: concrete-zone-1
 
     steps:
     - name: Checkout code
@@ -77,6 +87,7 @@ jobs:
         echo "  gcp_cluster_zone: ${{ github.event.inputs.gcp_cluster_zone }}"
         echo "  gcp_sa_key_base64: ${{ github.event.inputs.gcp_sa_key_base64 != '' && '*** provided ***' || 'NOT provided' }}"
         echo "  image_tag       : ${{ github.event.inputs.image_tag }}"
+        echo "  domain          : ${{ github.event.inputs.domain != '' && github.event.inputs.domain || '(blank -> <ip>.sslip.io)' }}"
         echo "  tls_mode        : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
@@ -155,8 +166,8 @@ jobs:
         fi
         echo "Static IP: $IP ($REGION)"
         echo "ip=$IP" >> "$GITHUB_OUTPUT"
-        # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
-        FQDN="${IP//./-}.sslip.io"
+        # Without a domain, sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
+        FQDN="${DOMAIN:-${IP//./-}.sslip.io}"
         echo "App domain: $FQDN"
         echo "FQDN=$FQDN" >> "$GITHUB_ENV"
 
@@ -181,6 +192,58 @@ jobs:
         done
         echo "::error::ingress-nginx did not get the static IP $IP"
         kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
+        exit 1
+
+    # DNS must point at the IP before cert-manager requests the certificate:
+    # Let's Encrypt validates by fetching http://<domain>/.well-known/acme-challenge/...
+    - name: Create/Update Cloud DNS A Record
+      if: ${{ github.event.inputs.domain != '' }}
+      env:
+        IP: ${{ steps.static_ip.outputs.ip }}
+        TTL: 300
+      run: |
+        echo "Checking if DNS zone '$DNS_ZONE_NAME' exists..."
+        if ! gcloud dns managed-zones describe "$DNS_ZONE_NAME" --project="$GCP_PROJECT" > /dev/null 2>&1; then
+          echo "DNS zone '$DNS_ZONE_NAME' not found. Creating..."
+          gcloud dns managed-zones create "$DNS_ZONE_NAME" \
+            --project="$GCP_PROJECT" \
+            --description="Managed zone for crack detection" \
+            --dns-name="${DOMAIN}." \
+            --visibility="public"
+          echo "::warning::New Cloud DNS zone created - set these as the nameservers of $DOMAIN at the registrar (Hostinger):"
+          gcloud dns managed-zones describe "$DNS_ZONE_NAME" --project="$GCP_PROJECT" --format="value(nameServers)"
+        fi
+
+        EXISTING=$(gcloud dns record-sets list --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT" --name="${DOMAIN}." --type=A --format="value(rrdatas[0])")
+        if [[ "$EXISTING" == "$IP" ]]; then
+          echo "A record already points to $IP."
+        else
+          gcloud dns record-sets transaction start --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT"
+          if [[ -n "$EXISTING" ]]; then
+            EXISTING_TTL=$(gcloud dns record-sets list --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT" --name="${DOMAIN}." --type=A --format="value(ttl)")
+            echo "Removing old record: $EXISTING"
+            gcloud dns record-sets transaction remove "$EXISTING" \
+              --name="${DOMAIN}." --ttl="$EXISTING_TTL" --type=A --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT"
+          fi
+          echo "Adding new A record: $IP"
+          gcloud dns record-sets transaction add "$IP" \
+            --name="${DOMAIN}." --ttl=$TTL --type=A --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT"
+          gcloud dns record-sets transaction execute --zone="$DNS_ZONE_NAME" --project="$GCP_PROJECT"
+        fi
+
+        # Ask the zone's own name server (what Let's Encrypt ends up seeing),
+        # so resolver caches holding an old IP don't matter.
+        NS=$(gcloud dns managed-zones describe "$DNS_ZONE_NAME" --project="$GCP_PROJECT" --format="value(nameServers[0])")
+        for i in {1..30}; do
+          RESOLVED=$(dig +short A "$DOMAIN" @"${NS%.}" | tail -n 1)
+          if [[ "$RESOLVED" == "$IP" ]]; then
+            echo "DNS ready: $DOMAIN -> $IP"
+            exit 0
+          fi
+          echo "Waiting for $DOMAIN to resolve to $IP on $NS (got '${RESOLVED:-nothing}')... (attempt $i/30)"
+          sleep 10
+        done
+        echo "::error::$DOMAIN does not resolve to $IP on $NS"
         exit 1
 
     - name: Install cert-manager and Let's Encrypt issuers
@@ -283,8 +346,11 @@ jobs:
           case "$TLS_MODE" in
             letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
             letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
+            *)                   TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=) ;;
           esac
         else
+          # values-gcp.yaml enables TLS with letsencrypt-prod by default; turn both off for HTTP only.
+          TLS_ARGS+=(--set global.ingress.tls.enabled=false --set global.ingress.tls.clusterIssuer=)
           kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
         fi
 

@@ -5,6 +5,12 @@ name: Mahesh-AKS-deploy crack detection
 # "Deploy Kubernetes Cluster" workflow in concrete-detection-infra.
 # The app is exposed through an ingress-nginx controller whose public IP gets a free
 # Azure DNS name: <dns_label>.<region>.cloudapp.azure.com. The bare IP keeps serving HTTP.
+# The app is served on https://crackdetectionaks.online/ by default (the "domain" input).
+# The domain is hosted in an Azure DNS zone in resource group crack-detection-dns-rg (created on
+# the first run if missing, and kept apart from the cluster so its name servers survive cluster
+# rebuilds); its A record is pointed at the ingress IP before the certificate is requested.
+# The registrar (Hostinger) must use that zone's name servers - the run fails and prints them
+# until it does. Clear the "domain" input to serve on <dns_label>.<region>.cloudapp.azure.com.
 #
 # SSL (tls_mode):
 #   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
@@ -23,6 +29,8 @@ name: Mahesh-AKS-deploy crack detection
 #
 # Credentials: if azure_client_id / azure_client_secret are left blank, the
 # repository secrets AZURE_CLIENT_ID / AZURE_CLIENT_SECRET are used instead.
+# With a domain, the service principal also needs rights to create the DNS resource group and
+# zone (e.g. Contributor on the subscription).
 
 on:
   workflow_dispatch:
@@ -57,7 +65,7 @@ on:
         default: "crack-detection-cluster"
         type: string
       aks_resource_group:
-        description: "[Azure] AKS resource group (leave blank for '<cluster_name>-rg')"
+        description: "[Azure] AKS resource group (leave blank to look it up from the cluster name)"
         required: false
         type: string
       build_images:
@@ -74,6 +82,11 @@ on:
         description: "[Azure] DNS label for the ingress IP -> <label>.<region>.cloudapp.azure.com (unique per region)"
         required: true
         default: "crack-detection-mahesh"
+        type: string
+      domain:
+        description: "Domain in Azure DNS (zone in crack-detection-dns-rg); its A record is pointed at the ingress IP. Clear it to use <dns_label>.<region>.cloudapp.azure.com"
+        required: false
+        default: "crackdetectionaks.online"
         type: string
       tls_mode:
         description: "SSL certificate source"
@@ -93,6 +106,7 @@ jobs:
     env:
       TLS_MODE: ${{ github.event.inputs.tls_mode }}
       TLS_SECRET: concrete-gallery-tls
+      DNS_RESOURCE_GROUP: crack-detection-dns-rg
 
     steps:
     - name: Checkout code
@@ -113,6 +127,7 @@ jobs:
         echo "  build_images         : ${{ github.event.inputs.build_images }}"
         echo "  image_tag            : ${{ github.event.inputs.image_tag }}"
         echo "  dns_label            : ${{ github.event.inputs.dns_label }}"
+        echo "  domain               : ${{ github.event.inputs.domain != '' && github.event.inputs.domain || '(blank -> <dns_label>.<region>.cloudapp.azure.com)' }}"
         echo "  tls_mode             : ${{ github.event.inputs.tls_mode }}"
         echo "================================================"
 
@@ -214,11 +229,17 @@ jobs:
       id: aks
       env:
         DNS_LABEL: ${{ github.event.inputs.dns_label }}
+        DOMAIN: ${{ github.event.inputs.domain }}
       run: |
         CLUSTER_NAME="${{ github.event.inputs.aks_cluster_name }}"
         RG="${{ github.event.inputs.aks_resource_group }}"
         if [[ -z "$RG" ]]; then
-          RG="${CLUSTER_NAME}-rg"
+          echo "Looking up resource group for AKS cluster '$CLUSTER_NAME'..."
+          RG=$(az aks list --query "[?name=='$CLUSTER_NAME'].resourceGroup | [0]" -o tsv)
+          if [[ -z "$RG" ]]; then
+            echo "::error::AKS cluster '$CLUSTER_NAME' not found in this subscription. Set aks_resource_group or check aks_cluster_name."
+            exit 1
+          fi
         fi
         echo "Fetching credentials for AKS cluster '$CLUSTER_NAME' in resource group '$RG'..."
         az aks get-credentials --resource-group "$RG" --name "$CLUSTER_NAME" --overwrite-existing --admin
@@ -230,7 +251,13 @@ jobs:
           exit 1
         fi
         LOCATION=$(az aks show --resource-group "$RG" --name "$CLUSTER_NAME" --query location -o tsv)
-        FQDN="${DNS_LABEL}.${LOCATION}.cloudapp.azure.com"
+        AZURE_FQDN="${DNS_LABEL}.${LOCATION}.cloudapp.azure.com"
+        echo "Azure DNS name: $AZURE_FQDN"
+        echo "azure_fqdn=$AZURE_FQDN" >> "$GITHUB_OUTPUT"
+        echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+        DOMAIN="${DOMAIN,,}"
+        FQDN="${DOMAIN%.}"
+        FQDN="${FQDN:-$AZURE_FQDN}"
         echo "App domain: $FQDN"
         echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
 
@@ -243,7 +270,7 @@ jobs:
       id: ingress
       env:
         DNS_LABEL: ${{ github.event.inputs.dns_label }}
-        FQDN: ${{ steps.aks.outputs.fqdn }}
+        FQDN: ${{ steps.aks.outputs.azure_fqdn }}
       run: |
         helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
         helm repo update
@@ -272,7 +299,9 @@ jobs:
         echo "Ingress public IP: $IP"
         echo "ip=$IP" >> "$GITHUB_OUTPUT"
 
-        # Let's Encrypt validates over this name, so it must resolve before the certificate is requested.
+        # Without a domain, Let's Encrypt validates over the Azure name, so it must resolve before the
+        # certificate is requested. A custom domain is pointed at the IP in the next step instead.
+        [[ -n "${{ github.event.inputs.domain }}" ]] && exit 0
         for i in {1..60}; do
           RESOLVED=$(dig +short "$FQDN" @1.1.1.1 | tail -n 1)
           if [[ "$RESOLVED" == "$IP" ]]; then
@@ -284,6 +313,62 @@ jobs:
         done
         echo "::error::$FQDN does not resolve to $IP. The DNS label may already be taken in this region - try another dns_label."
         kubectl describe svc ingress-nginx-controller -n ingress-nginx | sed -n '/Events:/,$p' || true
+        exit 1
+
+    # DNS must point at the IP before cert-manager requests the certificate:
+    # Let's Encrypt validates by fetching http://<domain>/.well-known/acme-challenge/...
+    - name: Create/Update Azure DNS A record
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.domain != '' }}
+      env:
+        IP: ${{ steps.ingress.outputs.ip }}
+        DOMAIN: ${{ steps.aks.outputs.fqdn }}
+        LOCATION: ${{ steps.aks.outputs.location }}
+        TTL: 300
+      run: |
+        if ! az network dns zone show -g "$DNS_RESOURCE_GROUP" -n "$DOMAIN" --output none 2>/dev/null; then
+          echo "DNS zone '$DOMAIN' not found in '$DNS_RESOURCE_GROUP'. Creating..."
+          az group create -n "$DNS_RESOURCE_GROUP" -l "$LOCATION" --output none
+          az network dns zone create -g "$DNS_RESOURCE_GROUP" -n "$DOMAIN" --output none
+        fi
+        ZONE_NS=$(az network dns zone show -g "$DNS_RESOURCE_GROUP" -n "$DOMAIN" --query nameServers -o tsv | tr 'A-Z' 'a-z' | sed 's/\.$//' | sort)
+        echo "Name servers: $(echo $ZONE_NS)"
+
+        EXISTING=$(az network dns record-set a show -g "$DNS_RESOURCE_GROUP" -z "$DOMAIN" -n @ --query "ARecords[].ipv4Address" -o tsv 2>/dev/null || true)
+        if [[ "$EXISTING" == "$IP" ]]; then
+          echo "A record already points to $IP."
+        else
+          if [[ -n "$EXISTING" ]]; then
+            echo "Removing old record: $(echo $EXISTING)"
+            az network dns record-set a delete -g "$DNS_RESOURCE_GROUP" -z "$DOMAIN" -n @ --yes
+          fi
+          echo "Adding new A record: $IP"
+          az network dns record-set a add-record -g "$DNS_RESOURCE_GROUP" -z "$DOMAIN" -n @ --ipv4-address "$IP" --ttl "$TTL" --output none
+        fi
+
+        # The registrar must delegate the domain to this zone. Ask the TLD's name server directly,
+        # so resolver caches don't matter.
+        TLD="${DOMAIN##*.}"
+        TLD_NS=$(dig +short NS "$TLD." @1.1.1.1 | head -n 1)
+        DELEGATED=$(dig +norec +noall +authority NS "$DOMAIN" @"$TLD_NS" | awk '$4=="NS"{print tolower($5)}' | sed 's/\.$//' | sort)
+        if [[ "$DELEGATED" != "$ZONE_NS" ]]; then
+          echo "::error::$DOMAIN is delegated to [$(echo ${DELEGATED:-nothing})], not to its Azure DNS zone. At the registrar (Hostinger: Domains > $DOMAIN > DNS / Nameservers > Change nameservers) set exactly: $(echo $ZONE_NS) - then re-run this workflow."
+          exit 1
+        fi
+        echo "Delegation OK: $DOMAIN -> $(echo $ZONE_NS)"
+
+        # Ask the zone's own name server (what Let's Encrypt ends up seeing),
+        # so resolver caches holding an old IP don't matter.
+        NS=$(echo "$ZONE_NS" | head -n 1)
+        for i in {1..30}; do
+          RESOLVED=$(dig +short A "$DOMAIN" @"$NS" | tail -n 1)
+          if [[ "$RESOLVED" == "$IP" ]]; then
+            echo "DNS ready: $DOMAIN -> $IP"
+            exit 0
+          fi
+          echo "Waiting for $DOMAIN to resolve to $IP on $NS (got '${RESOLVED:-nothing}')... (attempt $i/30)"
+          sleep 10
+        done
+        echo "::error::$DOMAIN does not resolve to $IP on $NS"
         exit 1
 
     - name: Install cert-manager and Let's Encrypt issuers
@@ -377,6 +462,13 @@ jobs:
             letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
             letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
           esac
+          # A Certificate left over from a failed run is in cert-manager's retry backoff (an hour or more).
+          # Delete it so the ingress annotation recreates it and a fresh order starts now.
+          if kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && \
+             [[ "$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != "True" ]]; then
+            echo "Deleting not-ready Certificate $TLS_SECRET from a previous run"
+            kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
+          fi
         else
           kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
         fi
@@ -459,6 +551,7 @@ jobs:
         echo "  Gallery URL : $BASE/"
         echo "  Upload URL  : $BASE/upload"
         echo "  (plain IP)  : http://$IP/"
+        echo "  (Azure name): http://${{ steps.aks.outputs.azure_fqdn }}/"
         echo "================================================"
         {
           echo "### Crack detection deployed to AKS"

@@ -4,9 +4,12 @@ name: Mahesh-EKS-deploy crack detection
 # Deploys the crack-detection app to an EKS cluster created by the
 # "Deploy Kubernetes Cluster" workflow (provider = aws) in concrete-detection-infra.
 # The app is exposed through an ingress-nginx controller behind an AWS Network Load Balancer.
-# NLB IPs stay fixed for the life of the load balancer, so the app domain is either:
-#   - your own domain (input "domain"), pointed at the NLB with a CNAME record, or
-#   - left blank: a free wildcard-DNS name <nlb-ip-with-dashes>.sslip.io
+# The app is served on https://crackdetectioneks.online/ by default (the "domain" input).
+# The domain is hosted in a Route 53 public hosted zone (created on the first run if missing);
+# an alias A record is pointed at the NLB before the certificate is requested. The registrar
+# (Hostinger) must use that zone's name servers - the run fails and prints them until it does.
+# Clear the "domain" input to serve on a free wildcard-DNS name instead:
+#   <nlb-ip-with-dashes>.sslip.io  (NLB IPs stay fixed for the life of the load balancer)
 # The NLB address keeps serving HTTP.
 #
 # SSL (tls_mode):
@@ -28,7 +31,8 @@ name: Mahesh-EKS-deploy crack detection
 # repository secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are used instead.
 # The IAM identity must have access to the cluster. The infra workflow grants
 # cluster-admin to the identity that created the cluster, so the same deployer
-# IAM user works without extra setup.
+# IAM user works without extra setup. With a domain it also needs Route 53 access
+# (ListHostedZonesByName, CreateHostedZone, GetHostedZone, ChangeResourceRecordSets, GetChange).
 
 on:
   workflow_dispatch:
@@ -70,8 +74,9 @@ on:
         default: "auto"
         type: string
       domain:
-        description: "App domain. Leave blank for a free <nlb-ip>.sslip.io name, or enter your own (e.g. eks.example.com) and CNAME it to the NLB hostname the run prints"
+        description: "Domain in a Route 53 hosted zone; an alias A record is pointed at the NLB. Clear it to use <nlb-ip>.sslip.io"
         required: false
+        default: "crackdetectioneks.online"
         type: string
       tls_mode:
         description: "SSL certificate source"
@@ -273,6 +278,27 @@ jobs:
         echo "NLB IPs: $(echo $LB_IPS)"
         echo "ip=$IP" >> "$GITHUB_OUTPUT"
 
+        # A new NLB resolves before its targets pass health checks; until then connections time out
+        # and Let's Encrypt's HTTP-01 challenge fails. Wait until every NLB IP answers on port 80.
+        for i in {1..60}; do
+          PENDING=""
+          for ip in $LB_IPS; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "http://$ip/" || true)
+            [[ "$CODE" == "000" || -z "$CODE" ]] && PENDING="$PENDING $ip"
+          done
+          if [[ -z "$PENDING" ]]; then
+            echo "NLB is serving HTTP on all IPs"
+            break
+          fi
+          echo "Waiting for the NLB to accept connections on:$PENDING... (attempt $i/60)"
+          sleep 10
+        done
+        if [[ -n "$PENDING" ]]; then
+          echo "::error::NLB is not accepting connections on port 80 at:$PENDING"
+          kubectl get pods -n ingress-nginx -o wide || true
+          exit 1
+        fi
+
         if [[ -z "$DOMAIN" ]]; then
           # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
           FQDN="${IP//./-}.sslip.io"
@@ -282,19 +308,99 @@ jobs:
         fi
 
         FQDN="${DOMAIN,,}"
+        FQDN="${FQDN%.}"
+        echo "App domain: $FQDN"
         echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
-        echo "::notice::Point your domain at the NLB: CNAME  $FQDN  ->  $LB_HOST"
-        # Let's Encrypt validates over this name, so it must resolve to the NLB before the certificate is requested.
-        for i in {1..60}; do
-          RESOLVED=$(dig +short A "$FQDN" @1.1.1.1 | grep -E '^[0-9.]+$' || true)
+
+    # DNS must point at the NLB before cert-manager requests the certificate:
+    # Let's Encrypt validates by fetching http://<domain>/.well-known/acme-challenge/...
+    # An apex domain cannot be a CNAME, so the record is a Route 53 alias A record to the NLB.
+    - name: Create/Update Route 53 alias record
+      if: ${{ github.event.inputs.action == 'deploy' && github.event.inputs.domain != '' }}
+      env:
+        FQDN: ${{ steps.ingress.outputs.fqdn }}
+        LB_HOST: ${{ steps.ingress.outputs.lb_host }}
+      run: |
+        # Use the closest hosted zone that contains the domain; create one for the domain if there is none.
+        ZONE_ID="" ZONE_NAME=""
+        NAME="$FQDN"
+        while [[ "$NAME" == *.* ]]; do
+          ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$NAME." \
+            --query "HostedZones[?Name=='$NAME.' && Config.PrivateZone==\`false\`].Id | [0]" --output text)
+          if [[ -n "$ZONE_ID" && "$ZONE_ID" != "None" ]]; then
+            ZONE_NAME="$NAME"
+            break
+          fi
+          ZONE_ID=""
+          NAME="${NAME#*.}"
+        done
+        if [[ -z "$ZONE_ID" ]]; then
+          echo "No Route 53 hosted zone for $FQDN. Creating..."
+          ZONE_ID=$(aws route53 create-hosted-zone --name "$FQDN" \
+            --caller-reference "crack-detection-$(date +%s)" \
+            --hosted-zone-config Comment="Managed zone for crack detection" \
+            --query "HostedZone.Id" --output text)
+          ZONE_NAME="$FQDN"
+        fi
+        ZONE_ID="${ZONE_ID#/hostedzone/}"
+        ZONE_NS=$(aws route53 get-hosted-zone --id "$ZONE_ID" --query "DelegationSet.NameServers" --output text | tr '\t' '\n' | tr 'A-Z' 'a-z' | sort)
+        echo "Hosted zone: $ZONE_NAME ($ZONE_ID)"
+        echo "Name servers: $(echo $ZONE_NS)"
+
+        LB_ZONE_ID=$(aws elbv2 describe-load-balancers \
+          --query "LoadBalancers[?DNSName=='$LB_HOST'].CanonicalHostedZoneId | [0]" --output text)
+        if [[ -z "$LB_ZONE_ID" || "$LB_ZONE_ID" == "None" ]]; then
+          echo "::error::Could not find the NLB $LB_HOST in $AWS_REGION"
+          exit 1
+        fi
+
+        cat > change.json <<JSON
+        {
+          "Comment": "crack detection -> ingress-nginx NLB",
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "$FQDN.",
+              "Type": "A",
+              "AliasTarget": {
+                "HostedZoneId": "$LB_ZONE_ID",
+                "DNSName": "dualstack.$LB_HOST.",
+                "EvaluateTargetHealth": false
+              }
+            }
+          }]
+        }
+        JSON
+        cat change.json
+        CHANGE_ID=$(aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+          --change-batch file://change.json --query "ChangeInfo.Id" --output text)
+        aws route53 wait resource-record-sets-changed --id "$CHANGE_ID"
+        echo "Alias A record $FQDN -> $LB_HOST is in sync"
+
+        # The registrar must delegate the domain to this zone. Ask the TLD's name server directly,
+        # so resolver caches don't matter.
+        TLD="${ZONE_NAME##*.}"
+        TLD_NS=$(dig +short NS "$TLD." @1.1.1.1 | head -n 1)
+        DELEGATED=$(dig +norec +noall +authority NS "$ZONE_NAME" @"$TLD_NS" | awk '$4=="NS"{print tolower($5)}' | sed 's/\.$//' | sort)
+        if [[ "$DELEGATED" != "$ZONE_NS" ]]; then
+          echo "::error::$ZONE_NAME is delegated to [$(echo ${DELEGATED:-nothing})], not to its Route 53 zone. At the registrar (Hostinger: Domains > $ZONE_NAME > DNS / Nameservers > Change nameservers) set exactly: $(echo $ZONE_NS) - then re-run this workflow."
+          exit 1
+        fi
+        echo "Delegation OK: $ZONE_NAME -> $(echo $ZONE_NS)"
+
+        # Ask the zone's own name server (what Let's Encrypt ends up seeing).
+        NS=$(echo "$ZONE_NS" | head -n 1)
+        LB_IPS=$(dig +short A "$LB_HOST" @1.1.1.1 | grep -E '^[0-9.]+$' || true)
+        for i in {1..30}; do
+          RESOLVED=$(dig +short A "$FQDN" @"$NS" | grep -E '^[0-9.]+$' || true)
           if [[ -n "$RESOLVED" ]] && grep -qxFf <(echo "$LB_IPS") <<< "$RESOLVED"; then
             echo "DNS ready: $FQDN -> $(echo $RESOLVED)"
             exit 0
           fi
-          echo "Waiting for $FQDN to resolve to the NLB (got '$(echo ${RESOLVED:-nothing})')... (attempt $i/60)"
+          echo "Waiting for $FQDN to resolve to the NLB on $NS (got '$(echo ${RESOLVED:-nothing})')... (attempt $i/30)"
           sleep 10
         done
-        echo "::error::$FQDN does not resolve to the NLB. Create a CNAME record $FQDN -> $LB_HOST at your DNS provider and re-run."
+        echo "::error::$FQDN does not resolve to the NLB on $NS"
         exit 1
 
     - name: Install cert-manager and Let's Encrypt issuers
@@ -388,6 +494,13 @@ jobs:
             letsencrypt)         TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-prod) ;;
             letsencrypt-staging) TLS_ARGS+=(--set global.ingress.tls.clusterIssuer=letsencrypt-staging) ;;
           esac
+          # A Certificate left over from a failed run is in cert-manager's retry backoff (an hour or more).
+          # Delete it so the ingress annotation recreates it and a fresh order starts now.
+          if kubectl get certificate "$TLS_SECRET" >/dev/null 2>&1 && \
+             [[ "$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != "True" ]]; then
+            echo "Deleting not-ready Certificate $TLS_SECRET from a previous run"
+            kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
+          fi
         else
           kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true 2>/dev/null || true
         fi

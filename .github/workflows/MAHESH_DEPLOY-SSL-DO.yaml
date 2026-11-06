@@ -2,11 +2,14 @@ name: Mahesh-DO-SSL-deploy crack detection
 
 # Triggered manually from the GitHub Actions tab.
 # Deploys the crack-detection app to a DOKS cluster behind an ingress-nginx controller.
-# The app is served on a name built from the load balancer IP, so no domain is needed:
+# The app is served on https://crackdetectiondo.online/ by default (the "domain" input).
+# The domain is hosted in DigitalOcean DNS (added to the account on the first run if missing);
+# its A record (@) is pointed at the load balancer IP before the certificate is requested.
+# The registrar (Hostinger) must use ns1/ns2/ns3.digitalocean.com - the run fails and prints
+# them until it does. The bare IP keeps serving HTTP.
+# Clear the "domain" input to serve on a name built from the load balancer IP instead:
 #   <ip-with-dashes>.sslip.io  (e.g. 161-35-245-143.sslip.io; sslip.io resolves it to that IP)
 # Let's Encrypt does not issue normal certificates for a bare IP, hence the IP-based name.
-# Optionally set "domain" to a domain managed in DigitalOcean DNS instead; its A record (@)
-# is then pointed at the load balancer IP. The bare IP keeps serving HTTP.
 #
 # SSL (tls_mode):
 #   letsencrypt         - cert-manager + Let's Encrypt (trusted by all browsers, auto-renewed)
@@ -35,8 +38,9 @@ on:
         default: 'auto'
         type: string
       domain:
-        description: "Leave blank to use the load balancer IP (<ip>.sslip.io). Or a domain managed in DigitalOcean DNS; its A record (@) is pointed at the IP"
+        description: "Domain in DigitalOcean DNS (added if missing); its A record (@) is pointed at the load balancer IP. Clear it to use <ip>.sslip.io"
         required: false
+        default: "crackdetectiondo.online"
         type: string
       tls_mode:
         description: "SSL certificate source"
@@ -144,6 +148,9 @@ jobs:
           if [[ -n "$IP" ]]; then
             echo "Retrieved Ingress IP: $IP"
             echo "ingressIp=$IP" >> "$GITHUB_OUTPUT"
+            DOMAIN="${DOMAIN,,}"
+            DOMAIN="${DOMAIN%.}"
+            echo "DOMAIN=$DOMAIN" >> "$GITHUB_ENV"
             # sslip.io answers <a-b-c-d>.sslip.io with a.b.c.d, so no DNS setup is needed.
             FQDN="${DOMAIN:-${IP//./-}.sslip.io}"
             echo "App domain: $FQDN"
@@ -170,6 +177,11 @@ jobs:
           exit 1
         fi
 
+        if ! doctl compute domain get "$DOMAIN" >/dev/null 2>&1; then
+          echo "📌 Domain $DOMAIN not found in DigitalOcean DNS. Adding it..."
+          doctl compute domain create "$DOMAIN"
+        fi
+
         echo "🔍 Fetching existing A record for $DOMAIN..."
         RECORD_INFO=$(doctl compute domain records list "$DOMAIN" --format ID,Type,Name,Data --no-header 2>/dev/null | awk '$2=="A" && ($3=="@" || $3=="") {print $1, $4}' || true)
 
@@ -193,6 +205,18 @@ jobs:
             --record-ttl "$TTL"
           echo "✅ A record created!"
         fi
+
+        # The registrar must delegate the domain to DigitalOcean. Ask the TLD's name server directly,
+        # so resolver caches don't matter.
+        DO_NS=$(printf '%s\n' ns1.digitalocean.com ns2.digitalocean.com ns3.digitalocean.com)
+        TLD="${DOMAIN##*.}"
+        TLD_NS=$(dig +short NS "$TLD." @1.1.1.1 | head -n 1)
+        DELEGATED=$(dig +norec +noall +authority NS "$DOMAIN" @"$TLD_NS" | awk '$4=="NS"{print tolower($5)}' | sed 's/\.$//' | sort)
+        if [[ "$DELEGATED" != "$DO_NS" ]]; then
+          echo "::error::$DOMAIN is delegated to [$(echo ${DELEGATED:-nothing})], not to DigitalOcean. At the registrar (Hostinger: Domains > $DOMAIN > DNS / Nameservers > Change nameservers) set exactly: $(echo $DO_NS) - then re-run this workflow."
+          exit 1
+        fi
+        echo "Delegation OK: $DOMAIN -> $(echo $DO_NS)"
 
         # Ask DigitalOcean's authoritative name server (what Let's Encrypt ends up seeing),
         # so resolver caches holding the old IP don't matter.
@@ -293,9 +317,14 @@ jobs:
                      --set global.ingress.tls.enabled=true --set "global.ingress.tls.secretName=$TLS_SECRET")
           # A Certificate left from a run with another name may sit in cert-manager's failure
           # backoff (up to hours); delete it so the ingress recreates it for this name right away.
+          # The same goes for a not-ready Certificate left over from a failed run for this name.
           OLD_NAME=$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.spec.dnsNames[0]}' 2>/dev/null || true)
           if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$FQDN" ]]; then
             echo "Deleting Certificate for previous name $OLD_NAME"
+            kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
+          elif [[ -n "$OLD_NAME" && "$TLS_MODE" == letsencrypt* && \
+                  "$(kubectl get certificate "$TLS_SECRET" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != "True" ]]; then
+            echo "Deleting not-ready Certificate $TLS_SECRET from a previous run"
             kubectl delete certificate "$TLS_SECRET" --ignore-not-found=true
           fi
           case "$TLS_MODE" in

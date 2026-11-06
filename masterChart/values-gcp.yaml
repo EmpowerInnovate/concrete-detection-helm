@@ -1,16 +1,19 @@
 global:
   provider: gcp
   # Ingress served by the ingress-nginx controller installed by the GKE deploy workflow,
-  # on a regional static IP. The workflow sets hosts to <static-ip>.sslip.io (no domain needed).
-  # Leave hosts empty to serve the app on the static IP only (HTTP).
+  # on a regional static IP. The app is served on https://maheshconcretegallery.online/
+  # with a Let's Encrypt certificate issued by cert-manager (ClusterIssuer letsencrypt-prod).
+  # The workflow points the domain's A record (Cloud DNS zone concrete-zone-1) at the static IP
+  # and can override hosts / tls via its inputs.
   # (className: gce renders the older GKE ingress + Google-managed certificate instead.)
   ingress:
     className: nginx
-    hosts: []
+    hosts:
+      - maheshconcretegallery.online
     tls:
       # When enabled, the ingress serves HTTPS for every entry in hosts using secretName.
-      enabled: false
+      enabled: true
       secretName: concrete-gallery-tls
       # cert-manager ClusterIssuer that fills secretName (e.g. letsencrypt-prod).
       # Leave empty when the secret is created another way (e.g. mkcert).
-      clusterIssuer: ""
+      clusterIssuer: letsencrypt-prod
