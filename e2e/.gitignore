@@ -1,3 +1,9 @@
 node_modules/
 test-results/
 playwright-report/
+
+# Settings with cloud credentials (DO token, ...) - never commit
+.env
+
+# GitHub session cookies and the last deployed URL - never commit
+.auth/

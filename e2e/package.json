@@ -1,15 +1,26 @@
 {
   "name": "concrete-detection-e2e",
   "private": true,
-  "description": "Playwright checks against the deployed crack-detection app on each cloud's domain",
+  "description": "Deploy the crack-detection app with the GitHub deploy workflows, and check the deployed app on each cloud's domain",
   "scripts": {
     "test": "playwright test",
     "test:eks": "playwright test --project=eks",
     "test:aks": "playwright test --project=aks",
     "test:do": "playwright test --project=do",
-    "report": "playwright show-report"
+    "auth": "DEPLOY=1 FORCE_AUTH=1 playwright test --project=setup",
+    "deploy": "DEPLOY=1 playwright test",
+    "deploy:gke": "DEPLOY=1 DEPLOY_PROVIDER=gke playwright test",
+    "deploy:eks": "DEPLOY=1 DEPLOY_PROVIDER=eks playwright test",
+    "deploy:aks": "DEPLOY=1 DEPLOY_PROVIDER=aks playwright test",
+    "deploy:do": "DEPLOY=1 DEPLOY_PROVIDER=do playwright test",
+    "uninstall": "DEPLOY=1 DEPLOY_ACTION=uninstall playwright test",
+    "report": "playwright show-report",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@playwright/test": "1.56.1"
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.10.0",
+    "dotenv": "^16.4.5",
+    "typescript": "^5.7.2"
   }
 }
